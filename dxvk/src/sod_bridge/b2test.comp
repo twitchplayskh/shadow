@@ -1,0 +1,27 @@
+#version 460
+// SoD-RT bridge B2a test kernel: marks every pixel the game drew (depth != cleared value 0, reversed Z)
+// in the shared result buffer (1 byte per pixel, 0xFF / 0x00) and counts them, so both sides can check
+// that the depth copy arrived intact and the result came back.
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Depth  { uint depth[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Result { uint result[]; };
+layout(std430, set = 0, binding = 2)           buffer Count  { uint count[8]; };
+
+layout(push_constant) uniform PC { uint pixels; uint fmt; uint slot; } pc;   // fmt 0: D24 in 24 LSBs, 1: D32 float
+
+void main() {
+  uint w = gl_GlobalInvocationID.x;
+  uint base = w * 4u;
+  if (base >= pc.pixels) return;
+  uint packed = 0u, n = 0u;
+  for (uint k = 0u; k < 4u; k++) {
+    uint p = base + k;
+    if (p >= pc.pixels) break;
+    uint d = depth[p];
+    bool drawn = pc.fmt == 0u ? ((d & 0x00FFFFFFu) != 0u) : ((d & 0x7FFFFFFFu) != 0u);
+    if (drawn) { packed |= 0xFFu << (8u * k); n++; }
+  }
+  result[w] = packed;
+  if (n > 0u) atomicAdd(count[pc.slot], n);
+}

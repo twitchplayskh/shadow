@@ -1,0 +1,11 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create = DirectInput8Create_proxy@20
+    SoDFix_GetRayTracingLevel
+    SoDFix_GetAntiAliasing
+    SoDFix_GetTextureFiltering
+    SoDFix_GetCinematicBars
+    SoDFix_GetAmbientOcclusion
+    SoDFix_GetReflections
+    SoDFix_GetTextureTable
+    SoDFix_GetPresentSite

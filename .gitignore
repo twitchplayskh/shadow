@@ -1,0 +1,16 @@
+# build output
+dxvk/build*/
+sodfix/build/
+*.dll
+*.exe
+*.spv
+*.pdb
+*.lib
+# game data and working files (never commit game files)
+work/
+*.tbn2
+*.wad
+*.bin
+*.sdmk
+__pycache__/
+*.pkl

@@ -1,0 +1,7 @@
+LIBRARY D3D8.DLL
+EXPORTS
+  ValidatePixelShader @ 2
+  ValidateVertexShader @ 3
+  DebugSetMute @ 4
+  Direct3DCreate8 @ 5
+  DXVK_SoD_D3D9Texture = DXVK_SoD_D3D9Texture@4
