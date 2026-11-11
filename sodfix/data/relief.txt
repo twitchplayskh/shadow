@@ -1,0 +1,59 @@
+# Lebensbaum surface depth (relief) materials, generated from ccc.wad by tools/relief/make_relief_list.py
+# page <table index> <page w> <page h> <x> <y> <w> <h> <class>   region of a texture page
+# slot <table index> <class>                                     a sub-texture cut from a page at load
+# class: C cobblestone / setts, P stone paving slabs / flagstones, B brick paving
+page 1011 256 512 64 128 64 64 C
+page 991 256 512 0 256 32 32 C
+page 991 256 512 224 128 32 32 C
+page 885 128 512 0 288 32 32 C
+page 3 256 512 32 144 32 32 C
+page 68 256 512 64 232 32 32 C
+page 797 256 512 160 256 32 32 C
+page 1125 128 512 0 336 32 32 C
+page 1613 512 512 480 416 32 32 C
+page 750 128 512 0 320 32 32 C
+slot -1291 C
+page 797 256 512 96 268 32 32 C
+page 569 256 512 128 256 64 64 C
+page 569 256 512 192 128 64 64 C
+page 991 256 512 128 128 32 32 C
+page 3966 128 512 0 64 64 64 C
+page 1867 128 512 64 0 64 64 C
+slot -2450 P
+slot -2518 P
+slot -1908 P
+slot -2493 P
+page 367 512 512 256 0 128 128 P
+page 26 512 512 256 128 128 128 P
+page 1215 512 512 256 192 128 128 P
+page 913 512 512 256 128 128 128 P
+page 913 512 512 336 320 64 64 P
+page 26 512 512 256 384 64 64 P
+page 817 256 512 0 312 64 64 P
+slot -1802 P
+page 918 512 512 320 192 64 64 P
+page 913 512 512 0 384 64 64 P
+page 918 512 512 128 0 128 128 P
+page 913 512 512 0 64 128 128 P
+page 1023 512 512 0 320 64 64 P
+page 918 512 512 336 384 64 64 P
+slot -1410 P
+slot -1435 P
+page 1363 512 512 112 400 64 64 P
+page 1400 512 512 320 208 64 64 P
+slot -2058 B
+slot -2298 B
+slot -2196 B
+slot -1950 B
+slot -2398 B
+page 1530 512 512 0 256 64 64 B
+page 846 512 512 0 256 64 64 B
+page 797 256 512 192 64 64 64 B
+page 3 256 512 64 64 64 64 B
+page 68 256 512 128 64 64 64 B
+page 846 512 512 128 308 64 64 B
+page 1520 512 512 128 308 64 64 B
+page 103 512 512 384 256 64 64 B
+slot -201 B
+page 846 512 512 192 288 64 64 B
+page 128 512 512 24 384 64 64 B

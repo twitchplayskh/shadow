@@ -1,0 +1,189 @@
+#version 450
+// Lebensbaum texture upscaling: every ordinary game texture is uploaded to the GPU at 2x or 4x its size.
+// The game still sees (and locks) the original; only the Vulkan image is bigger. Edge-directed 2x passes in the
+// manner of super-xBR: new texels are interpolated along the local edge direction (4-tap lines, slightly sharper
+// than cubic), chosen by comparing how much the luminance varies along the two candidate directions, then clamped
+// to the nearest known texels so edges stay clean (no ringing, no halos). 4x = two 2x steps.
+// Colours are processed premultiplied by alpha, so cut-out textures (leaves, railings) get no dark fringes.
+//
+// modes: 0 decode (raw device format -> float RGBA, premultiplied), 1 diagonal pass (src -> dst at 2x, writes
+// the source texels and the new diagonal texels), 2 orthogonal pass (in place on dst), 3 pack (float -> device
+// format, un-premultiplied), 4 plain bilinear enlargement (text: looks like the original under the game's
+// bilinear filter). All addressing wraps: most of the game's textures tile.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer RawBuf  { uint raw[]; };
+layout(binding = 1, std430)          buffer SrcBuf  { vec4 srcp[]; };
+layout(binding = 2, std430)          buffer DstBuf  { vec4 dstp[]; };
+layout(binding = 3, std430) writeonly buffer OutBuf { uint outp[]; };
+
+layout(push_constant) uniform PC {
+  uvec4 a;     // w, h (of the pass input; pack: of the output), mode, format
+  uvec4 b;     // flags (bit 0: no alpha / opaque, bit 1: text), edge strength (0..256), output scale, final scale (pack)
+} pc;
+
+// outer / inner weights of the 4-tap line interpolation (super-xBR uses 0.129633 for its first pass)
+const float kOuter = -0.125, kInner = 0.625;
+
+ivec2 wrapc(ivec2 p, ivec2 wh) { return ivec2(uint(p.x + 4096 * wh.x) % uint(wh.x), uint(p.y + 4096 * wh.y) % uint(wh.y)); }
+float luma(vec4 c) { return dot(c.rgb, vec3(0.299, 0.587, 0.114)) + 0.35 * c.a; }
+
+vec4 decode(uint i) {
+  uint f = pc.a.w;
+  if (f <= 1u) {
+    vec4 c = unpackUnorm4x8(raw[i]);
+    return f == 0u ? c.bgra : c;
+  }
+  uint t = (raw[i >> 1] >> ((i & 1u) * 16u)) & 0xFFFFu;
+  if (f == 2u) return vec4(float((t >> 10) & 31u) / 31.0, float((t >> 5) & 31u) / 31.0, float(t & 31u) / 31.0, float(t >> 15));
+  if (f == 3u) return vec4(float(t >> 11) / 31.0, float((t >> 5) & 63u) / 63.0, float(t & 31u) / 31.0, 1.0);
+  if (f == 4u) return vec4(float((t >> 8) & 15u), float((t >> 4) & 15u), float(t & 15u), float(t >> 12)) / 15.0;
+  if (f == 5u) return vec4(float((t >> 4) & 15u), float((t >> 8) & 15u), float(t >> 12), float(t & 15u)) / 15.0;
+  if (f == 6u) return vec4(float(t >> 12), float((t >> 8) & 15u), float((t >> 4) & 15u), float(t & 15u)) / 15.0;
+  if (f == 7u) return vec4(float((t >> 1) & 31u) / 31.0, float((t >> 6) & 31u) / 31.0, float(t >> 11) / 31.0, float(t & 1u));
+  if (f == 8u) return vec4(float(t & 31u) / 31.0, float((t >> 5) & 63u) / 63.0, float(t >> 11) / 31.0, 1.0);
+  return vec4(0.5);
+}
+
+uint q(float v, float m) { return uint(clamp(v, 0.0, 1.0) * m + 0.5); }
+uint encode16(vec4 c) {
+  uint f = pc.a.w;
+  if (f == 2u) return (c.a >= 0.5 ? 0x8000u : 0u) | (q(c.r, 31.0) << 10) | (q(c.g, 31.0) << 5) | q(c.b, 31.0);
+  if (f == 3u) return (q(c.r, 31.0) << 11) | (q(c.g, 63.0) << 5) | q(c.b, 31.0);
+  if (f == 4u) return (q(c.a, 15.0) << 12) | (q(c.r, 15.0) << 8) | (q(c.g, 15.0) << 4) | q(c.b, 15.0);
+  if (f == 5u) return (q(c.b, 15.0) << 12) | (q(c.g, 15.0) << 8) | (q(c.r, 15.0) << 4) | q(c.a, 15.0);
+  if (f == 6u) return (q(c.r, 15.0) << 12) | (q(c.g, 15.0) << 8) | (q(c.b, 15.0) << 4) | q(c.a, 15.0);
+  if (f == 7u) return (q(c.b, 31.0) << 11) | (q(c.g, 31.0) << 6) | (q(c.r, 31.0) << 1) | (c.a >= 0.5 ? 1u : 0u);
+  if (f == 8u) return (q(c.b, 31.0) << 11) | (q(c.g, 63.0) << 5) | q(c.r, 31.0);
+  return 0u;
+}
+
+vec4 S(ivec2 p) { ivec2 wh = ivec2(pc.a.xy); p = wrapc(p, wh); return srcp[uint(p.y * wh.x + p.x)]; }
+vec4 D(ivec2 p) { ivec2 wh = ivec2(pc.a.xy) * 2; p = wrapc(p, wh); return dstp[uint(p.y * wh.x + p.x)]; }
+void setD(ivec2 p, vec4 v) { ivec2 wh = ivec2(pc.a.xy) * 2; dstp[uint(p.y * wh.x + p.x)] = v; }
+
+vec4 line4(vec4 a, vec4 b, vec4 c, vec4 d) { return kOuter * (a + d) + kInner * (b + c); }
+float df(vec4 a, vec4 b) { return abs(luma(a) - luma(b)); }
+
+// blend between the two directional estimates by how much more the texture varies across one direction than
+// the other; equal variation gives their average (close to bicubic)
+// the average for corners and texture noise; only a clear edge (much less variation along it than across)
+// pulls the result towards the interpolation along that edge, so square stones keep their corners
+vec4 directional(vec4 cA, vec4 cB, float varA, float varB) {
+  float e = (varB - varA) / (varA + varB + 1e-3);           // > 0: smoother along A
+  float k = float(pc.b.y) / 256.0;
+  float t = 0.5 + 0.5 * sign(e) * smoothstep(0.35, 0.85, abs(e)) * k;
+  return mix(cB, cA, t);
+}
+
+vec4 antiRing(vec4 v, vec4 a, vec4 b, vec4 c, vec4 d) {
+  vec4 lo = min(min(a, b), min(c, d)), hi = max(max(a, b), max(c, d));
+  return clamp(v, lo, hi);
+}
+
+void main() {
+  uvec2 g = gl_GlobalInvocationID.xy;
+  uint mode = pc.a.z;
+  ivec2 wh = ivec2(pc.a.xy);
+
+  if (mode == 0u) {                                         // decode
+    if (g.x >= pc.a.x || g.y >= pc.a.y) return;
+    uint i = g.y * pc.a.x + g.x;
+    vec4 c = decode(i);
+    if ((pc.b.x & 1u) != 0u) c.a = 1.0;
+    srcp[i] = vec4(c.rgb * c.a, c.a);
+    return;
+  }
+
+  if (mode == 4u) {                                         // bilinear: src (w x h) -> dst (w*s x h*s)
+    uint sc = pc.b.z, ow = pc.a.x * sc, oh = pc.a.y * sc;
+    if (g.x >= ow || g.y >= oh) return;
+    vec2 f = (vec2(g) + 0.5) / float(sc) - 0.5;
+    ivec2 b = ivec2(floor(f)); f -= vec2(b);
+    vec4 c = mix(mix(S(b), S(b + ivec2(1, 0)), f.x), mix(S(b + ivec2(0, 1)), S(b + ivec2(1, 1)), f.x), f.y);
+    dstp[g.y * ow + g.x] = c;
+    return;
+  }
+
+  if (mode == 1u) {                                         // diagonal pass: one source texel -> 2x2 block
+    if (g.x >= pc.a.x || g.y >= pc.a.y) return;
+    ivec2 p = ivec2(g);
+    ivec2 o = p * 2;
+    vec4 p00 = S(p), p10 = S(p + ivec2(1, 0)), p01 = S(p + ivec2(0, 1)), p11 = S(p + ivec2(1, 1));
+    setD(o, p00);
+    // the new texel sits in the middle of p00, p10, p01, p11
+    // line along '\': (-1,-1) (0,0) (1,1) (2,2); along '/': (2,-1) (1,0) (0,1) (-1,2)
+    vec4 m11 = S(p + ivec2(-1, -1)), m22 = S(p + ivec2(2, 2)), m2a = S(p + ivec2(2, -1)), ma2 = S(p + ivec2(-1, 2));
+    vec4 cBack = line4(m11, p00, p11, m22);
+    vec4 cFwd  = line4(m2a, p10, p01, ma2);
+    // variation along each direction (pairs one step apart along it, near the centre weighted more)
+    vec4 m10 = S(p + ivec2(-1, 0)), m01 = S(p + ivec2(0, -1)), p20 = S(p + ivec2(2, 0)), p02 = S(p + ivec2(0, 2));
+    vec4 p21 = S(p + ivec2(2, 1)), p12 = S(p + ivec2(1, 2)), m1p1 = S(p + ivec2(-1, 1)), p1m1 = S(p + ivec2(1, -1));
+    float vBack = 2.0 * df(p00, p11) + df(m10, p01) + df(m01, p10) + df(p01, p12) + df(p10, p21) + 0.5 * (df(m11, p00) + df(p11, m22));
+    float vFwd  = 2.0 * df(p10, p01) + df(p00, m1p1) + df(p1m1, p00) + df(p20, p11) + df(p11, p02) + 0.5 * (df(m2a, p10) + df(p01, ma2));
+    vec4 c = directional(cBack, cFwd, vBack, vFwd);
+    setD(o + ivec2(1, 1), antiRing(c, p00, p10, p01, p11));
+    return;
+  }
+
+  if (mode == 2u) {                                         // orthogonal pass: the two remaining texels per block
+    if (g.x >= pc.a.x || g.y >= pc.a.y) return;
+    ivec2 base = ivec2(g) * 2;
+    for (int k = 0; k < 2; k++) {
+      ivec2 t = base + (k == 0 ? ivec2(1, 0) : ivec2(0, 1));
+      // known texels are where x + y is even: left / right and up / down of t, on lines 3 apart
+      vec4 l1 = D(t + ivec2(-1, 0)), r1 = D(t + ivec2(1, 0)), l3 = D(t + ivec2(-3, 0)), r3 = D(t + ivec2(3, 0));
+      vec4 u1 = D(t + ivec2(0, -1)), d1 = D(t + ivec2(0, 1)), u3 = D(t + ivec2(0, -3)), d3 = D(t + ivec2(0, 3));
+      vec4 cH = line4(l3, l1, r1, r3), cV = line4(u3, u1, d1, d3);
+      float vH = 2.0 * df(l1, r1) + df(D(t + ivec2(-2, -1)), u1) + df(u1, D(t + ivec2(2, -1)))
+               + df(D(t + ivec2(-2, 1)), d1) + df(d1, D(t + ivec2(2, 1)));
+      float vV = 2.0 * df(u1, d1) + df(D(t + ivec2(-1, -2)), l1) + df(l1, D(t + ivec2(-1, 2)))
+               + df(D(t + ivec2(1, -2)), r1) + df(r1, D(t + ivec2(1, 2)));
+      vec4 c = directional(cH, cV, vH, vV);
+      setD(t, antiRing(c, l1, r1, u1, d1));
+    }
+    return;
+  }
+
+  // pack (a.xy = output size; binding 1 = the enlarged image at b.w x, binding 2 = the decoded source)
+  // 3x is resampled from the 4x result. Text: the edges are rebuilt like a font renderer would draw them at this
+  // size - between the darkest and brightest of the 4 nearest source texels, a steep ramp around the middle.
+  uint f = pc.a.w;
+  uint os = pc.b.z, fs = pc.b.w;
+  uint ow = pc.a.x, oh = pc.a.y;
+  ivec2 swh = ivec2(ow / os, oh / os), fwh = swh * int(fs);
+  bool text = (pc.b.x & 2u) != 0u;
+  uint per = f <= 1u ? 1u : 2u;
+  if (g.x * per >= ow || g.y >= oh) return;
+  vec4 cs[2];
+  for (uint k = 0u; k < per; k++) {
+    ivec2 p = ivec2(g.x * per + k, g.y);
+    vec4 c;
+    if (fs == os) c = srcp[uint(p.y) * uint(fwh.x) + uint(p.x)];
+    else {
+      vec2 q = (vec2(p) + 0.5) * float(fs) / float(os) - 0.5;
+      ivec2 b0 = ivec2(floor(q)); vec2 t = q - vec2(b0);
+      ivec2 p00 = wrapc(b0, fwh), p10 = wrapc(b0 + ivec2(1, 0), fwh), p01 = wrapc(b0 + ivec2(0, 1), fwh), p11 = wrapc(b0 + ivec2(1, 1), fwh);
+      c = mix(mix(srcp[p00.y * fwh.x + p00.x], srcp[p10.y * fwh.x + p10.x], t.x),
+              mix(srcp[p01.y * fwh.x + p01.x], srcp[p11.y * fwh.x + p11.x], t.x), t.y);
+    }
+    if (text) {
+      vec2 sp = (vec2(p) + 0.5) / float(os) - 0.5;
+      ivec2 b0 = ivec2(floor(sp));
+      ivec2 q00 = wrapc(b0, swh), q10 = wrapc(b0 + ivec2(1, 0), swh), q01 = wrapc(b0 + ivec2(0, 1), swh), q11 = wrapc(b0 + ivec2(1, 1), swh);
+      vec4 n0 = dstp[q00.y * swh.x + q00.x], n1 = dstp[q10.y * swh.x + q10.x], n2 = dstp[q01.y * swh.x + q01.x], n3 = dstp[q11.y * swh.x + q11.x];
+      vec4 lo = min(min(n0, n1), min(n2, n3)), hi = max(max(n0, n1), max(n2, n3));
+      float kr = 0.55 * float(os);
+      vec4 t = clamp((c - lo) / max(hi - lo, vec4(1e-4)), 0.0, 1.0);
+      vec4 r = lo + (hi - lo) * clamp((t - 0.5) * kr + 0.5, 0.0, 1.0);
+      c = mix(c, r, step(vec4(0.06), hi - lo));
+    }
+    c.rgb = c.a > 1e-4 ? c.rgb / c.a : vec3(0.0);
+    if ((pc.b.x & 1u) != 0u) c.a = 1.0;
+    cs[k] = clamp(c, 0.0, 1.0);
+  }
+  uint i = g.y * ow + g.x * per;
+  if (f <= 1u) outp[i] = packUnorm4x8(f == 0u ? cs[0].bgra : cs[0]);
+  else outp[i >> 1] = encode16(cs[0]) | (encode16(cs[1]) << 16);
+}

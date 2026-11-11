@@ -1,0 +1,187 @@
+#version 450
+// Lebensbaum surface depth: height / normal map generation for one ground texture (or one region of a texture page).
+// Runs once per texture, in 8 short passes (push constant mode), on a raw copy of the texture's top mip level.
+//
+// The maps are built at up to 4x the texture's resolution (the game's ground textures are often 32x32), from a
+// bilinear reconstruction of the texture, so joints come out as clean lines instead of texel blobs.
+// The height is not the brightness. Joints between stones (mortar, gaps between setts and slabs) are found as
+// line-shaped valleys of the luminance that are darker than their neighbourhood, with a per-material share of the
+// surface (histogram quantile), and only where they continue along a line (stains and specks are dropped). The
+// stones are what is left: flat tops with edges rounded over a material-specific width (distance to the nearest
+// joint), a gentle crown for cobbles, and a little surface grain. All addressing wraps: floor textures tile.
+//
+// binding 0: raw texels (device format, source resolution), binding 1: albedo atlas (RGBA8, source resolution),
+// binding 2: relief atlas (R = height, G/B = slope x/y per relief texel, A = joint), binding 3: scratch
+// (4 float planes at relief resolution + histogram, min, max).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer RawBuf     { uint raw[]; };
+layout(binding = 1, std430) writeonly buffer AlbedoBuf { uint albedo[]; };
+layout(binding = 2, std430) writeonly buffer ReliefBuf { uint relief[]; };
+layout(binding = 3, std430)          buffer ScratchBuf { uint scratch[]; };
+
+layout(push_constant) uniform PC {
+  uvec4 a;     // relief w, h, mode, raw format
+  uvec4 b;     // raw offset (words), albedo offset (texels), scratch offset (words), material class (1 C, 2 P, 3 B)
+  uvec4 c;     // scale (relief texels per source texel), relief offset (texels), source w, source h
+} pc;
+
+uint W() { return pc.a.x; }
+uint H() { return pc.a.y; }
+uint N() { return pc.a.x * pc.a.y; }
+int  SC() { return int(pc.c.x); }
+
+ivec2 wrapc(ivec2 p) { return ivec2(uint(p.x + 4096 * int(W())) % W(), uint(p.y + 4096 * int(H())) % H()); }
+uint  idx(ivec2 p) { p = wrapc(p); return uint(p.y) * W() + uint(p.x); }
+float plane(uint k, ivec2 p) { return uintBitsToFloat(scratch[pc.b.z + k * N() + idx(p)]); }
+void  setPlane(uint k, uint i, float v) { scratch[pc.b.z + k * N() + i] = floatBitsToUint(v); }
+uint  histBase() { return pc.b.z + 4u * N(); }
+float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+vec4 decode(uint i) {
+  uint f = pc.a.w;
+  if (f <= 1u) {
+    vec4 c = unpackUnorm4x8(raw[pc.b.x + i]);
+    return f == 0u ? c.bgra : c;
+  }
+  uint t = (raw[pc.b.x + (i >> 1)] >> ((i & 1u) * 16u)) & 0xFFFFu;
+  if (f == 2u) return vec4(float((t >> 10) & 31u) / 31.0, float((t >> 5) & 31u) / 31.0, float(t & 31u) / 31.0, float(t >> 15));
+  if (f == 3u) return vec4(float(t >> 11) / 31.0, float((t >> 5) & 63u) / 63.0, float(t & 31u) / 31.0, 1.0);
+  if (f == 4u) return vec4(float((t >> 8) & 15u), float((t >> 4) & 15u), float(t & 15u), float(t >> 12)) / 15.0;
+  if (f == 5u) return vec4(float((t >> 4) & 15u), float((t >> 8) & 15u), float(t >> 12), float(t & 15u)) / 15.0;
+  if (f == 6u) return vec4(float(t >> 12), float((t >> 8) & 15u), float((t >> 4) & 15u), float(t & 15u)) / 15.0;
+  if (f == 7u) return vec4(float((t >> 1) & 31u) / 31.0, float((t >> 6) & 31u) / 31.0, float(t >> 11) / 31.0, float(t & 1u));
+  if (f == 8u) return vec4(float(t & 31u) / 31.0, float((t >> 5) & 63u) / 63.0, float(t >> 11) / 31.0, 1.0);
+  return vec4(0.5);
+}
+vec4 srcTexel(ivec2 q) {
+  ivec2 sw = ivec2(pc.c.zw);
+  q = ivec2(uint(q.x + 4096 * sw.x) % uint(sw.x), uint(q.y + 4096 * sw.y) % uint(sw.y));
+  return decode(uint(q.y * sw.x + q.x));
+}
+// bilinear reconstruction of the source texture at a relief texel
+vec4 srcColor(ivec2 p) {
+  vec2 f = (vec2(p) + 0.5) / float(SC()) - 0.5;
+  ivec2 b = ivec2(floor(f)); f -= vec2(b);
+  return mix(mix(srcTexel(b), srcTexel(b + ivec2(1, 0)), f.x), mix(srcTexel(b + ivec2(0, 1)), srcTexel(b + ivec2(1, 1)), f.x), f.y);
+}
+
+float gaussPlane(uint k, ivec2 p, int r, float sig) {
+  float s = 0.0, n = 0.0;
+  for (int y = -r; y <= r; y++)
+    for (int x = -r; x <= r; x++) {
+      float w = exp(-float(x * x + y * y) / (2.0 * sig * sig));
+      s += w * plane(k, p + ivec2(x, y)); n += w;
+    }
+  return s / n;
+}
+
+int S() { return int(min(W(), H())); }
+int boxR() { return clamp(S() / 10, 2, 6 * SC()); }
+
+void meanSd(ivec2 p, out float mu, out float sd) {
+  int R = boxR(), st = max(1, SC() / 2); float s = 0.0, s2 = 0.0, n = 0.0;
+  for (int y = -R; y <= R; y += st)
+    for (int x = -R; x <= R; x += st) { float v = plane(1u, p + ivec2(x, y)); s += v; s2 += v * v; n += 1.0; }
+  mu = s / n; sd = sqrt(max(s2 / n - mu * mu, 0.0)) + 0.02;
+}
+
+// largest Hessian eigenvalue (> 0 across a dark line), from plane k with step st
+float valley(uint k, ivec2 p, int st, float c) {
+  float lxx = plane(k, p + ivec2(st, 0)) + plane(k, p - ivec2(st, 0)) - 2.0 * c;
+  float lyy = plane(k, p + ivec2(0, st)) + plane(k, p - ivec2(0, st)) - 2.0 * c;
+  float lxy = (plane(k, p + ivec2(st, st)) - plane(k, p + ivec2(st, -st)) - plane(k, p + ivec2(-st, st)) + plane(k, p + ivec2(-st, -st))) * 0.25;
+  return 0.5 * (lxx + lyy) + sqrt(0.25 * (lxx - lyy) * (lxx - lyy) + lxy * lxy);
+}
+
+float quota() { return pc.b.w == 1u ? 0.26 : pc.b.w == 2u ? 0.12 : 0.15; }
+
+void main() {
+  uvec2 g = gl_GlobalInvocationID.xy;
+  uint mode = pc.a.z;
+  if (mode == 0u && g.x < 258u && g.y == 0u) {             // histogram, min, max
+    scratch[histBase() + g.x] = g.x == 256u ? 0x7F7FFFFFu : 0u;
+  }
+  if (g.x >= W() || g.y >= H()) return;
+  ivec2 p = ivec2(g);
+  uint i = g.y * W() + g.x;
+
+  if (mode == 0u) {                                         // decode: albedo atlas (source texels) + luminance
+    if ((p.x % SC()) == 0 && (p.y % SC()) == 0) {
+      ivec2 q = p / SC();
+      albedo[pc.b.y + uint(q.y) * pc.c.z + uint(q.x)] = packUnorm4x8(srcTexel(q));
+    }
+    setPlane(0u, i, lum(srcColor(p).rgb));
+  } else if (mode == 1u) {                                  // lightly smoothed luminance (about one source texel)
+    int r = max(1, SC() / 2);
+    setPlane(1u, i, gaussPlane(0u, p, r, 0.35 * float(SC()) + 0.45));
+  } else if (mode == 2u) {                                  // joint score + histogram
+    float ls = plane(1u, p), mu, sd;
+    meanSd(p, mu, sd);
+    float dark = (mu - ls) / sd;
+    float v = max(valley(1u, p, SC(), ls), valley(1u, p, 2 * SC(), ls) * 0.6) / sd;
+    // colour: joints differ in hue from the stone faces
+    int R = boxR(), st = max(2, SC()); vec3 cm = vec3(0.0); float n = 0.0;
+    for (int y = -R; y <= R; y += st) for (int x = -R; x <= R; x += st) { cm += srcColor(p + ivec2(x, y)).rgb; n += 1.0; }
+    cm /= n;
+    vec3 c = srcColor(p).rgb;
+    float chroma = length((c - cm) - vec3(lum(c) - lum(cm))) / (sd + 0.03);
+    float score = max(v, 0.0) * 0.8 + max(dark, 0.0) * 0.45 + (dark > 0.0 ? 0.1 * clamp(chroma - 0.8, 0.0, 2.0) : 0.0);
+    if (v <= -0.2) score = 0.0;
+    setPlane(2u, i, score);
+    atomicAdd(scratch[histBase() + min(uint(score * 64.0), 255u)], 1u);
+  } else if (mode == 3u) {                                  // joints: the material's share of the surface
+    uint target = uint(quota() * float(N())), acc = 0u, b = 255u;
+    for (int k = 255; k >= 0; k--) { acc += scratch[histBase() + uint(k)]; if (acc > target) { b = uint(k); break; } }
+    float t = max(float(b + 1u) / 64.0, 0.15);
+    float s = plane(2u, p);
+    setPlane(3u, i, clamp((s - t) / (0.6 * t) + 0.5, 0.0, 1.0));
+  } else if (mode == 4u) {                                  // keep joints that continue along a line
+    int Lr = max(2, int(round(float(S()) * (pc.b.w == 3u ? 0.04 : 0.06))));
+    int st = max(1, SC() / 2);
+    float sup = 0.0;
+    const ivec2 dirs[4] = ivec2[4](ivec2(1, 0), ivec2(0, 1), ivec2(1, 1), ivec2(1, -1));
+    for (int d = 0; d < 4; d++) {
+      float acc = 0.0, n = 0.0;
+      for (int k = -Lr; k <= Lr; k += st) { acc += plane(3u, p + dirs[d] * k); n += 1.0; }
+      sup = max(sup, acc / n);
+    }
+    setPlane(2u, i, plane(3u, p) * clamp((sup - 0.35) / 0.25, 0.0, 1.0));
+  } else if (mode == 5u) {                                  // distance to the nearest joint (relief texels)
+    int rc = int(ceil(float(S()) * (pc.b.w == 1u ? 0.07 : pc.b.w == 2u ? 0.03 : 0.035)));
+    rc = clamp(rc, 2, 16);
+    float best = float(rc);
+    for (int y = -rc; y <= rc; y++)
+      for (int x = -rc; x <= rc; x++) {
+        float gj = plane(2u, p + ivec2(x, y));
+        if (gj < 0.25) continue;
+        // partial joints count as further away
+        float d = length(vec2(x, y)) + (1.0 - gj) * 1.5;
+        best = min(best, d);
+      }
+    setPlane(3u, i, best / float(rc));
+  } else if (mode == 6u) {                                  // height
+    float t = clamp(gaussPlane(3u, p, 1, 0.8), 0.0, 1.0);
+    float edge = sqrt(max(1.0 - (1.0 - t) * (1.0 - t), 0.0));   // rounded stone edge, flat top
+    float crownR = float(max(2, int(round(float(S()) * 0.05))));
+    float crown = gaussPlane(3u, p, int(crownR), crownR * 0.6);  // larger stones rise a little more in the middle
+    float kc = pc.b.w == 1u ? 0.22 : 0.06;
+    float kg = pc.b.w == 1u ? 0.05 : 0.04;
+    float mu, sd; meanSd(p, mu, sd);
+    float grain = clamp((plane(1u, p) - mu) / sd, -2.0, 2.0) * 0.5;
+    float h = (1.0 - kc) * edge + kc * crown * edge + kg * grain * edge;
+    h += 1.0;                                               // positive: float bits order like uints
+    setPlane(0u, i, h);
+    atomicMin(scratch[histBase() + 256u], floatBitsToUint(h));
+    atomicMax(scratch[histBase() + 257u], floatBitsToUint(h));
+  } else {                                                  // normalise, slopes (height units per relief texel)
+    float lo = uintBitsToFloat(scratch[histBase() + 256u]), hi = uintBitsToFloat(scratch[histBase() + 257u]);
+    float sc = 1.0 / max(hi - lo, 1e-4);
+    float h  = (plane(0u, p) - lo) * sc;
+    float hx = (plane(0u, p + ivec2(1, 0)) - plane(0u, p - ivec2(1, 0))) * 0.5 * sc;
+    float hy = (plane(0u, p + ivec2(0, 1)) - plane(0u, p - ivec2(0, 1))) * 0.5 * sc;
+    vec2 sl = clamp(vec2(hx, hy) * 2.0, -1.0, 1.0);         // stored x2 for precision (slopes are small at 4x)
+    relief[pc.c.y + i] = packUnorm4x8(vec4(h, sl * 0.5 + 0.5, plane(2u, p)));
+  }
+}

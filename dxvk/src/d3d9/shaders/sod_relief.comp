@@ -1,0 +1,291 @@
+#version 450
+// Lebensbaum surface depth: parallax occlusion mapping on the ground textures of SoDFix\relief.txt, applied in screen
+// space after the opaque scene (the game draws with the fixed-function pipeline, so its shaders can't be changed).
+//
+// Inputs: float copy of the game's depth (reversed: d = P10 + P14 / z), the frame so far (B8G8R8A8), and the UV / id
+// buffer our replay of the ground draws wrote (R16G16B16A16: R, G = the draw's own UVs through a mirrored identity
+// texture (no wrap seam), B = which half of the mirror period (u, v), A = relief entry id + 1; 0 = no relief).
+// Per pixel: tangent frame from neighbouring depth and UVs, a ray march into the generated height field, then the
+// frame's colour times albedo(shifted) / albedo(original): the game's lighting, fog and baked shading stay as they
+// are, only the texture detail moves. Plus normal-map shading, self-shadowing and a little cavity darkening.
+// Output: B8G8R8A8 colour + alpha (fade: distance, fog, grazing angle), blended over the frame.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer DepthBuf  { float depth[]; };
+layout(binding = 1, std430) readonly buffer ColorBuf  { uint color[]; };
+layout(binding = 2, std430) readonly buffer UvBuf     { uvec2 uvid[]; };
+layout(binding = 3, std430) readonly buffer AlbedoBuf { uint albedo[]; };
+layout(binding = 4, std430) readonly buffer ReliefBuf { uint relief[]; };
+layout(binding = 5, std430) readonly buffer ItemBuf   { uint items[]; };
+layout(binding = 6, std430) writeonly buffer OutBuf   { uint outp[]; };
+
+layout(push_constant) uniform PC {
+  uvec4 size;    // W, H, march steps, flags (bit 0: self-shadow)
+  vec4  proj;    // P0, P5, P10, P14
+  vec4  vp;      // viewport x, y, w, h
+  vec4  light;   // view-space direction to the light (xyz), shading strength
+  vec4  fog;     // start, end, on, debug
+  vec4  par;     // depth (fraction of the tile) for cobbles, slabs, bricks; max shift (fraction of the tile)
+  vec4  up;      // view-space world up (xyz), edge feather width (source texels)
+} pc;
+
+// item table: [0, 512) = per entry (first item, count); items from 512, 8 words each:
+//   0 albedo offset (texels), 1 w | h << 16, 2 region x | y << 16, 3 texture w | h << 16, 4 class | ready << 8,
+//   5 relief offset (texels), 6 relief scale (relief texels per texture texel)
+const uint kItems = 512u;
+
+bool validDepth(float d) { return d > 1e-7 && d <= 1.0; }
+float viewZ(float d) { return pc.proj.w / (d - pc.proj.z); }
+vec3 viewPos(vec2 pix, float z) {
+  vec2 ndc = vec2((pix.x - pc.vp.x) / pc.vp.z * 2.0 - 1.0, 1.0 - (pix.y - pc.vp.y) / pc.vp.w * 2.0);
+  return vec3(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z);
+}
+
+struct Item { uint off; ivec2 wh; ivec2 r; vec2 tex; uint cls; bool ready; uint roff; int sc; };
+Item item(uint k) {
+  uint b = kItems + k * 8u;
+  Item it;
+  it.off = items[b];
+  it.wh  = ivec2(items[b + 1u] & 0xFFFFu, items[b + 1u] >> 16);
+  it.r   = ivec2(items[b + 2u] & 0xFFFFu, items[b + 2u] >> 16);
+  it.tex = vec2(float(items[b + 3u] & 0xFFFFu), float(items[b + 3u] >> 16));
+  it.cls = items[b + 4u] & 255u;
+  it.ready = ((items[b + 4u] >> 8) & 255u) != 0u;
+  it.roff = items[b + 5u];
+  it.sc   = max(int(items[b + 6u]), 1);
+  return it;
+}
+
+// texel position of a pixel: uv (frac) * texture size, minus the item's region; returns item index or -1
+int pixelTexel(uint i, out vec2 s, out Item it) {
+  uvec2 q = uvid[i];
+  uint a = q.y >> 16;
+  if (a == 0u) return -1;
+  uint id = uint(round(float(a) / 65535.0 * 255.0));
+  if (id == 0u || id > 255u) return -1;
+  vec2 t = vec2(float(q.x & 0xFFFFu), float(q.x >> 16)) / 65535.0;
+  uint bits = uint(round(float(q.y & 0xFFFFu) / 65535.0 * 255.0 / 64.0));
+  vec2 uv = vec2((bits & 1u) != 0u ? 1.0 - t.x : t.x, (bits & 2u) != 0u ? 1.0 - t.y : t.y);
+  uint first = items[(id - 1u) * 2u], count = items[(id - 1u) * 2u + 1u];
+  for (uint k = 0u; k < count && k < 16u; k++) {
+    it = item(first + k);
+    vec2 tx = uv * it.tex - vec2(it.r);
+    if (tx.x >= -0.5 && tx.y >= -0.5 && tx.x < float(it.wh.x) + 0.5 && tx.y < float(it.wh.y) + 0.5) { s = tx; return int(first + k); }
+  }
+  return -1;
+}
+
+ivec2 wrapT(ivec2 p, ivec2 wh) { return ivec2(uint(p.x + 4096 * wh.x) % uint(wh.x), uint(p.y + 4096 * wh.y) % uint(wh.y)); }
+uint texelIndex(Item it, ivec2 p) { p = wrapT(p, it.wh); return it.off + uint(p.y * it.wh.x + p.x); }
+uint reliefIndex(Item it, ivec2 p) { ivec2 rwh = it.wh * it.sc; p = wrapT(p, rwh); return it.roff + uint(p.y * rwh.x + p.x); }
+
+float heightAt(Item it, vec2 s) {
+  vec2 f = s * float(it.sc) - 0.5; ivec2 b = ivec2(floor(f)); f -= vec2(b);
+  float h00 = float(relief[reliefIndex(it, b)] & 255u), h10 = float(relief[reliefIndex(it, b + ivec2(1, 0))] & 255u);
+  float h01 = float(relief[reliefIndex(it, b + ivec2(0, 1))] & 255u), h11 = float(relief[reliefIndex(it, b + ivec2(1, 1))] & 255u);
+  return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y) / 255.0;
+}
+vec4 reliefAt(Item it, vec2 s) {
+  vec2 f = s * float(it.sc) - 0.5; ivec2 b = ivec2(floor(f)); f -= vec2(b);
+  vec4 a = unpackUnorm4x8(relief[reliefIndex(it, b)]), c = unpackUnorm4x8(relief[reliefIndex(it, b + ivec2(1, 0))]);
+  vec4 d = unpackUnorm4x8(relief[reliefIndex(it, b + ivec2(0, 1))]), e = unpackUnorm4x8(relief[reliefIndex(it, b + ivec2(1, 1))]);
+  return mix(mix(a, c, f.x), mix(d, e, f.x), f.y);
+}
+vec3 albedoAt(Item it, vec2 s) {
+  vec2 f = s - 0.5; ivec2 b = ivec2(floor(f)); f -= vec2(b);
+  vec3 a = unpackUnorm4x8(albedo[texelIndex(it, b)]).rgb, c = unpackUnorm4x8(albedo[texelIndex(it, b + ivec2(1, 0))]).rgb;
+  vec3 d = unpackUnorm4x8(albedo[texelIndex(it, b + ivec2(0, 1))]).rgb, e = unpackUnorm4x8(albedo[texelIndex(it, b + ivec2(1, 1))]).rgb;
+  return mix(mix(a, c, f.x), mix(d, e, f.x), f.y);
+}
+
+vec3 fetchColor(uint i) {
+  uint c = color[i];
+  return vec3(float((c >> 16) & 255u), float((c >> 8) & 255u), float(c & 255u)) / 255.0;
+}
+uint packOut(vec3 c, float a) {
+  uvec3 q = uvec3(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+  return (uint(clamp(a, 0.0, 1.0) * 255.0 + 0.5) << 24) | (q.r << 16) | (q.g << 8) | q.b;
+}
+
+// neighbour along a screen axis: (dP, ds) or false (other surface, other item, depth step)
+bool neighbour1(ivec2 p, ivec2 o, int self, vec3 P, vec2 s, ivec2 wh, out vec3 dP, out vec2 ds) {
+  ivec2 q = p + o;
+  if (q.x < 0 || q.y < 0 || q.x >= int(pc.size.x) || q.y >= int(pc.size.y)) return false;
+  uint j = uint(q.y) * pc.size.x + uint(q.x);
+  float d = depth[j];
+  if (!validDepth(d)) return false;
+  vec2 sn; Item itn;
+  if (pixelTexel(j, sn, itn) != self) return false;
+  vec3 Pn = viewPos(vec2(q) + 0.5, viewZ(d));
+  dP = Pn - P;
+  if (abs(dP.z) > 0.05 * P.z + 4.0) return false;
+  ds = sn - s;
+  ds -= round(ds / vec2(wh)) * vec2(wh);                    // tiles wrap
+  return true;
+}
+vec2 wrapDiff(vec2 d, ivec2 wh) { return d - round(d / vec2(wh)) * vec2(wh); }
+// one-sided derivative that is trusted only when the mapping continues smoothly 2 pixels out (no UV seam,
+// no other polygon with a different texture layout in between)
+bool neighbour(ivec2 p, ivec2 o, int self, vec3 P, vec2 s, ivec2 wh, out vec3 dP, out vec2 ds) {
+  if (!neighbour1(p, o, self, P, s, wh, dP, ds)) return false;
+  vec3 dP2; vec2 ds2;
+  if (!neighbour1(p, o * 2, self, P, s, wh, dP2, ds2)) return false;
+  if (length(ds2 - 2.0 * ds) > 0.2 * length(ds2) + 0.01) return false;
+  if (length(dP2 - 2.0 * dP) > 0.2 * length(dP2) + 0.05) return false;
+  return true;
+}
+
+void main() {
+  uvec2 g = gl_GlobalInvocationID.xy;
+  if (g.x >= pc.size.x || g.y >= pc.size.y) return;
+  ivec2 p = ivec2(g);
+  uint i = g.y * pc.size.x + g.x;
+  outp[i] = 0u;
+  vec2 s; Item it;
+  int self = pixelTexel(i, s, it);
+  if (self < 0 || !it.ready) return;
+  float d0 = depth[i];
+  if (!validDepth(d0)) return;
+  vec3 P = viewPos(vec2(p) + 0.5, viewZ(d0));
+
+  // screen derivatives: central where both sides agree, else the side with the smaller texel step
+  vec3 dPx, dPy; vec2 dsx, dsy;
+  {
+    vec3 a, b; vec2 sa, sb;
+    bool ha = neighbour(p, ivec2(1, 0), self, P, s, it.wh, a, sa), hb = neighbour(p, ivec2(-1, 0), self, P, s, it.wh, b, sb);
+    if (ha && hb && length(sa + sb) < 0.25 * (length(sa) + length(sb)) + 0.02) { dPx = 0.5 * (a - b); dsx = 0.5 * (sa - sb); }
+    else if (ha && (!hb || length(sa) <= length(sb))) { dPx = a; dsx = sa; }
+    else if (hb) { dPx = -b; dsx = -sb; }
+    else { outp[i] = 0u; return; }
+    bool hc = neighbour(p, ivec2(0, 1), self, P, s, it.wh, a, sa), hd = neighbour(p, ivec2(0, -1), self, P, s, it.wh, b, sb);
+    if (hc && hd && length(sa + sb) < 0.25 * (length(sa) + length(sb)) + 0.02) { dPy = 0.5 * (a - b); dsy = 0.5 * (sa - sb); }
+    else if (hc && (!hd || length(sa) <= length(sb))) { dPy = a; dsy = sa; }
+    else if (hd) { dPy = -b; dsy = -sb; }
+    else return;
+  }
+  mat2 J = mat2(dsx, dsy);                                  // texels per pixel (columns: x, y)
+  float det = determinant(J);
+  if (abs(det) < 1e-8) return;
+  mat2 Ji = inverse(J);
+  vec3 Tu = dPx * Ji[0][0] + dPy * Ji[0][1];                // view units per texel along u, v
+  vec3 Tv = dPx * Ji[1][0] + dPy * Ji[1][1];
+  vec3 N = normalize(cross(dPx, dPy));
+  vec3 V = normalize(-P);
+  if (dot(N, V) < 0.0) N = -N;
+  float Vn = dot(N, V);
+
+  // fades: texture minified (atlas has no mips), fog, grazing view, not ground (walls with a listed texture)
+  float tpp = sqrt(abs(det));
+  float w = 1.0 - smoothstep(0.6, 1.25, tpp);
+  if (pc.fog.z > 0.5) w *= 1.0 - clamp((P.z - pc.fog.x) / max(pc.fog.y - pc.fog.x, 1.0), 0.0, 1.0);
+  w *= smoothstep(0.08, 0.3, Vn);
+  if (dot(pc.up.xyz, pc.up.xyz) > 0.5) w *= smoothstep(0.55, 0.8, abs(dot(N, normalize(pc.up.xyz))));
+  if (w <= 0.003) return;
+
+  // edge feather: the relief flattens out towards any place where this texture mapping ends (UV seam between
+  // polygons, another material, a surface without relief), so edges blend in instead of standing out
+  float feather = 1.0;
+  {
+    float R = clamp(pc.up.w / max(tpp, 1e-3), 3.0, 64.0);   // pixels
+    float nearest = R;
+    const vec2 dirs[8] = vec2[8](vec2(1, 0), vec2(-1, 0), vec2(0, 1), vec2(0, -1),
+                                 vec2(0.7071, 0.7071), vec2(-0.7071, 0.7071), vec2(0.7071, -0.7071), vec2(-0.7071, -0.7071));
+    for (int k = 0; k < 8; k++) {
+      for (int r = 1; r <= 3; r++) {
+        float dist = R * float(r) / 3.0;
+        if (dist >= nearest) break;
+        vec2 off = dirs[k] * dist;
+        ivec2 q = p + ivec2(round(off));
+        bool edge = q.x < 0 || q.y < 0 || q.x >= int(pc.size.x) || q.y >= int(pc.size.y);
+        if (!edge) {
+          uint j = uint(q.y) * pc.size.x + uint(q.x);
+          vec2 sq; Item itq;
+          float dq = depth[j];
+          vec2 o = vec2(q - p);
+          if (!validDepth(dq) || pixelTexel(j, sq, itq) != self) edge = true;
+          else {
+            vec2 pred = J * o;
+            if (length(wrapDiff(sq - s - pred, it.wh)) > 0.35 + 0.1 * length(pred)) edge = true;
+            vec3 Pq = viewPos(vec2(q) + 0.5, viewZ(dq));
+            if (abs(Pq.z - (P.z + dot(vec3(dPx.z, dPy.z, 0.0), vec3(o, 0.0)))) > 0.02 * P.z + 2.0) edge = true;
+          }
+        }
+        if (edge) { nearest = dist; break; }
+      }
+    }
+    feather = smoothstep(0.0, 1.0, nearest / R);
+  }
+
+  // metric of the texel frame: offsets in view space -> texel offsets (least squares in the surface plane)
+  float guu = dot(Tu, Tu), guv = dot(Tu, Tv), gvv = dot(Tv, Tv);
+  mat2 G = mat2(guu, guv, guv, gvv);
+  if (abs(determinant(G)) < 1e-12) return;
+  mat2 Gi = inverse(G);
+  float texelW = sqrt(sqrt(guu * gvv));
+  float tile = sqrt(float(it.wh.x * it.wh.y));
+  float dk = it.cls == 1u ? pc.par.x : it.cls == 2u ? pc.par.y : pc.par.z;
+  float depthW = dk * tile * texelW * feather;              // view units from the stone tops to the joints
+
+  vec3 Vt = V - N * Vn;
+  vec2 dS = Gi * vec2(dot(Tu, -Vt), dot(Tv, -Vt)) * (depthW / max(Vn, 0.05));
+  float maxShift = pc.par.w * tile;
+  if (length(dS) > maxShift) dS *= maxShift / length(dS);
+
+  // march down from the surface plane (height 1) to the joints (height 0)
+  int n = int(mix(float(pc.size.z), float(pc.size.z) * 0.5, Vn));
+  n = clamp(n, 4, 48);
+  float stepD = 1.0 / float(n), dPrev = 0.0, hPrev = heightAt(it, s), dHit = 1.0;
+  if (1.0 - hPrev > 0.0) {
+    for (int k = 1; k <= n; k++) {
+      float dd = float(k) * stepD;
+      float h = heightAt(it, s + dS * dd);
+      if (dd >= 1.0 - h) {
+        float a0 = (1.0 - hPrev) - dPrev, a1 = dd - (1.0 - h);      // secant between the last two samples
+        dHit = mix(dPrev, dd, clamp(a0 / max(a0 + a1, 1e-5), 0.0, 1.0));
+        break;
+      }
+      dPrev = dd; hPrev = h;
+    }
+  } else dHit = 0.0;
+  vec2 sh = s + dS * dHit;
+
+  // colour: the frame times albedo(shifted) / albedo(here)
+  vec3 C = fetchColor(i);
+  vec3 a0 = albedoAt(it, s), a1 = albedoAt(it, sh);
+  vec3 ratio = clamp((a1 + 0.03) / (a0 + 0.03), vec3(0.3), vec3(3.0));
+
+  // normal from the height slopes (height units per texel) through the dual basis of the texel frame
+  vec4 r = reliefAt(it, sh);
+  vec2 sl = (r.gb * 2.0 - 1.0) * 0.5 * float(it.sc) * depthW;   // stored slope x2 per relief texel -> per texel
+  vec3 gu = Tu * Gi[0][0] + Tv * Gi[0][1], gv = Tu * Gi[1][0] + Tv * Gi[1][1];
+  vec3 nm = normalize(N - (sl.x * gu + sl.y * gv));
+  vec3 L = normalize(pc.light.xyz);
+  const float amb = 0.62;
+  float shade = (amb + (1.0 - amb) * max(dot(nm, L), 0.0)) / (amb + (1.0 - amb) * max(dot(N, L), 0.0));
+  shade = mix(1.0, shade, pc.light.w * feather);
+
+  // self-shadow: from the hit point toward the light, through the height field
+  float hHit = 1.0 - dHit, occl = 0.0;
+  float Ln = dot(N, L);
+  if ((pc.size.w & 1u) != 0u && Ln > 0.05 && hHit < 0.95) {
+    vec3 Lt = L - N * Ln;
+    vec2 dL = Gi * vec2(dot(Tu, Lt), dot(Tv, Lt)) * (depthW / Ln);
+    if (length(dL) > maxShift) dL *= maxShift / length(dL);
+    for (int k = 1; k <= 6; k++) {
+      float up = float(k) / 6.0 * (1.0 - hHit);
+      float hh = heightAt(it, sh + dL * up);
+      occl = max(occl, clamp((hh - (hHit + up)) * 6.0, 0.0, 1.0));
+    }
+  }
+  float shadow = 1.0 - 0.28 * occl * feather;
+  float cavity = mix(1.0 - 0.12 * feather, 1.0, smoothstep(0.0, 0.5, hHit));
+
+  vec3 res = C * ratio * shade * shadow * cavity;
+  if (pc.fog.w > 0.5) {                                     // debug: 1 = height, 2 = items / frame
+    if (pc.fog.w < 1.5) res = vec3(hHit);
+    else res = vec3(fract(float(self) * 0.37), fract(float(self) * 0.61), fract(s.x / float(it.wh.x)));
+    w = 1.0;
+  }
+  outp[i] = packOut(res, w);
+}
