@@ -78,9 +78,11 @@ All new options appear in the game's own OPTION menus and are saved to `SoDFix.i
 
 ## Installing
 
-1. Download the release and copy everything in it into the game folder, next to `shadow.exe`
+1. Download the fix EXE and place in game folder https://www.moddb.com/downloads/fixed-exe-for-sodsom-vista-newer
+  
+3. Download the release and copy everything in it into the game folder, next to `shadow.exe`
    (`C:\Program Files (x86)\Konami\Shadow Of Destiny` by default; Windows will ask for admin rights).
-2. Start the game and open OPTION > GRAPHIC SETTING.
+4. Start the game and open OPTION > GRAPHIC SETTING.
 
 To uninstall, delete `dinput8.dll`, `d3d8.dll`, `d3d9.dll`, `sod_rt64.exe`, `dxvk.conf`, `SoDFix.ini` and the
 `SoDFix` folder.
