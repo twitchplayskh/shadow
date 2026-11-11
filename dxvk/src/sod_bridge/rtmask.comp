@@ -161,14 +161,24 @@ int bandTiles() {
   return int((px + kTile - 1u) / kTile);
 }
 
-// ---- pass 2: dilate the edge tiles
+// ---- pass 2: dilate the edge tiles; an active tile stores 1 + its distance (in tiles) to the nearest edge tile
 void passDilate(uint t) {
   int tx = int(t % tilesX()), ty = int(t / tilesX()), r = bandTiles();
-  bool act = false;
-  for (int y = max(ty - r, 0); y <= min(ty + r, int(tilesY()) - 1) && !act; y++)
+  int best = r + 1;
+  for (int y = max(ty - r, 0); y <= min(ty + r, int(tilesY()) - 1); y++)
     for (int x = max(tx - r, 0); x <= min(tx + r, int(tilesX()) - 1); x++)
-      if (tiles[uint(y) * tilesX() + uint(x)] != 0u) { act = true; break; }
-  tiles[tilesX() * tilesY() + t] = act ? 1u : 0u;
+      if (tiles[uint(y) * tilesX() + uint(x)] != 0u) best = min(best, max(abs(x - tx), abs(y - ty)));
+  tiles[tilesX() * tilesY() + t] = best <= r ? uint(best) + 1u : 0u;
+}
+uint edgeDistAt(uint x, uint y) { return tiles[tilesX() * tilesY() + (y / kTile) * tilesX() + x / kTile] - 1u; }
+
+// world position of screen point (px, py) at depth d
+vec3 worldAt(float px, float py, float d) {
+  vec4 h = vec4((px - f.vpX) / f.vpW * 2.0 - 1.0, 1.0 - (py - f.vpY) / f.vpH * 2.0, d, 1.0);
+  vec4 w;
+  for (int j = 0; j < 4; j++)
+    w[j] = h.x * f.invVP[j] + h.y * f.invVP[4 + j] + h.z * f.invVP[8 + j] + h.w * f.invVP[12 + j];
+  return w.xyz / w.w;
 }
 
 // angular size of light l seen from pos (tan): distant lights use the global setting; lamps have a radius
@@ -177,6 +187,27 @@ float spreadOf(uint l, vec3 pos, float globalSpread) {
   if (!isPoint(l)) return globalSpread;
   float R = f.boxes[l * 3u + 1u].x;
   return max(globalSpread, min(R / max(length(f.lights[l].xyz - pos), 1.0), 0.5));
+}
+
+// any pixel within Chebyshev radius r of (x, y) whose hard hit bits differ from (x, y)'s?
+bool changeWithin(uint x, uint y, int r) {
+  uint own = bitsAt(y * f.width + x);
+  int x0 = max(int(x) - r, 0), x1 = min(int(x) + r, int(f.width) - 1);
+  int y0 = max(int(y) - r, 0), y1 = min(int(y) + r, int(f.height) - 1);
+  uint ownRep = own * 0x01010101u;
+  for (int yy = y0; yy <= y1; yy++) {
+    uint row = uint(yy) * f.width;
+    uint p0 = row + uint(x0), p1 = row + uint(x1);
+    for (uint w = p0 >> 2; w <= (p1 >> 2); w++) {
+      uint diff = bits[w] ^ ownRep;
+      if (diff == 0u) continue;
+      for (uint k = 0u; k < 4u; k++) {
+        uint q = w * 4u + k;
+        if (q >= p0 && q <= p1 && ((diff >> (8u * k)) & 255u) != 0u) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ---- pass 3: cone of rays near the edges, one sample per soft pixel (softScale x softScale block)
@@ -189,8 +220,40 @@ void passCone(uint id) {
   uint samples = clamp((f.flags >> 8) & 255u, 4u, 64u);
   float gspread = float(f.flags >> 16) * 1e-4;
   float d = depth[p];
+  bool reach = false;
+  vec3 pos = vec3(0.0);
   if (activeAt(x, y) && d > 0.0 && d <= 1.0) {
-    vec3 pos = worldPos(p, d);
+    // Can this pixel be in a penumbra at all? A cone ray drifts sideways by at most (distance to the farthest
+    // caster) x (cone angle); on screen that is at most rW / (size of one pixel there) pixels. The pixel needs
+    // rays only if a hard shadow edge (an edge tile) is within that reach (+ the upsample's reach); otherwise
+    // every ray of its cone agrees with the hard result it already has. The band of pass 2 is sized for the
+    // worst case on the whole screen; this sizes it per pixel (small around the feet, wider up the body).
+    pos = worldPos(p, d);
+    float pw = max(length(worldAt(float(x) + 1.5, float(y) + 0.5, d) - pos), 1e-4);
+    // the receiver's facing (from the depth of the neighbours): a cone ray's sideways drift lands on a surface
+    // the light grazes stretched by 1 / cos(incidence)
+    uint xn = x + 1u < f.width ? x + 1u : x - 1u, yn = y + 1u < f.height ? y + 1u : y - 1u;
+    float dx = depth[y * f.width + xn], dy = depth[yn * f.width + x];
+    vec3 nrm = vec3(0.0);
+    if (dx > 0.0 && dy > 0.0) nrm = cross(worldPos(y * f.width + xn, dx) - pos, worldPos(yn * f.width + x, dy) - pos);
+    float nl = length(nrm);
+    float gspread0 = float(f.flags >> 16) * 1e-4, rW = 0.0;
+    for (uint l = 0u; l < f.lightCount && l < 8u; l++) {
+      float sp = spreadOf(l, pos, gspread0);
+      if (!mayHit(l, pos, sp)) continue;
+      float tm;
+      if (isPoint(l)) { vec4 bs = f.boxes[l * 3u]; tm = length(bs.xyz - pos) + bs.w; }
+      else tm = max(f.boxes[l * 3u + 2u].z - dot(pos, f.lights[l].xyz), 0.0);
+      vec3 Ld = isPoint(l) ? normalize(f.lights[l].xyz - pos) : f.lights[l].xyz;
+      float cosI = nl > 0.0 ? abs(dot(nrm / nl, Ld)) : 0.0;
+      rW = max(rW, tm * sp / max(cosI, 0.1));
+    }
+    float rPx = rW / pw + 1.5;
+    reach = rW > 0.0 && float(int(edgeDistAt(x, y)) - 1) * float(kTile) <= rPx;
+    // close range: look for an actual hard-shadow change (hit bits differ) within the reach, pixel by pixel
+    if (reach && rPx <= 24.0) reach = changeWithin(x, y, int(ceil(rPx)));
+  }
+  if (reach) {
     // per-pixel rotation of the sample disk (interleaved gradient noise); the filter in pass 4 removes it
     float rot = 6.2831853 * fract(52.9829189 * fract(0.06711056 * float(id % sw) + 0.00583715 * float(id / sw)));
     float lit = 1.0;

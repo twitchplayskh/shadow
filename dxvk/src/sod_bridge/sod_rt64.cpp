@@ -443,7 +443,31 @@ struct FrameBuild {
     uint32_t count = 0;
 };
 
-static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb) {
+// BLAS refit: the casters' triangles are the same from one request to the next (same characters, same counts),
+// only their positions move. Then the light's BLAS is UPDATED from the previous request's one (src = that slot's
+// BLAS, dst = this slot's) instead of built from scratch: same triangles, same rays, same shadows - only the
+// tree is adjusted to the new positions instead of re-made. Tree quality drifts as characters move, so every
+// kRefitLimit-th request per chain is a full build again. A change in the casters (count, order of sizes) = build.
+struct BlasHist { std::vector<uint32_t> prims; VkAccelerationStructureKHR as = VK_NULL_HANDLE; uint32_t refits = 0; };
+static std::vector<BlasHist> g_hist[SOD_BRIDGE_SLOTS];
+static uint64_t g_histReq[SOD_BRIDGE_SLOTS] = { };
+static const uint32_t kRefitLimit = 30;
+static uint64_t g_statBuilds = 0, g_statRefits = 0;
+
+static const BlasHist* FindRefitSource(uint64_t reqIdx, uint32_t slot, const std::vector<uint32_t>& prims) {
+    for (uint64_t back = 1; back < SOD_BRIDGE_SLOTS && back <= reqIdx; back++) {
+        const uint64_t idx = reqIdx - back;
+        const uint32_t js = uint32_t(idx % SOD_BRIDGE_SLOTS);
+        if (js == slot || g_histReq[js] != idx) continue;
+        for (const BlasHist& h : g_hist[js])
+            if (h.as && h.refits < kRefitLimit && h.prims == prims) return &h;
+    }
+    return nullptr;
+}
+
+static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb, uint32_t slot, uint64_t reqIdx) {
+    static const bool envNoRefit = [] { char v[8] = { }; return GetEnvironmentVariableA("SODRT_NO_REFIT", v, 8) && v[0] == '1'; }();
+    std::vector<BlasHist> hist;
     VkDeviceSize need = VkDeviceSize(g.triCount) * 36;
     if (need > sl.vertCap) {
         FreeBuf(sl.verts); FreeBuf(sl.staging);
@@ -477,14 +501,15 @@ static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb) {
         VkAccelerationStructureBuildGeometryInfoKHR& bg = fb.bg[b];
         bg = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
         bg.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;   // rebuilt every frame, traced once
+        bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
         bg.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         bg.geometryCount = uint32_t(geos.size()); bg.pGeometries = geos.data();
         VkAccelerationStructureBuildSizesInfoKHR bs = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
         vkGetAccelerationStructureBuildSizesKHR_(g_dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bg, prims.data(), &bs);
         LightAS& la = sl.las[b];
         if (bs.accelerationStructureSize > la.cap || !la.as) {
-            if (la.as) vkDestroyAccelerationStructureKHR_(g_dev, la.as, nullptr);
+            // a later request may still refit from this BLAS on the GPU: let everything finish before it goes
+            if (la.as) { vkDeviceWaitIdle_(g_dev); vkDestroyAccelerationStructureKHR_(g_dev, la.as, nullptr); }
             FreeBuf(la.buf);
             VkDeviceSize cap = bs.accelerationStructureSize + bs.accelerationStructureSize / 2 + 65536;
             if (!MakeBuffer(la.buf, cap, kAsSt, kGpu)) return false;
@@ -496,14 +521,24 @@ static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb) {
             dai.accelerationStructure = la.as;
             la.addr = vkGetAccelerationStructureDeviceAddressKHR_(g_dev, &dai);
         }
-        if (bs.buildScratchSize + 256 > la.scratchCap) {
+        const VkDeviceSize scr = bs.buildScratchSize > bs.updateScratchSize ? bs.buildScratchSize : bs.updateScratchSize;
+        if (scr + 256 > la.scratchCap) {
             FreeBuf(la.scratch);
-            VkDeviceSize cap = bs.buildScratchSize + bs.buildScratchSize / 2 + 65536;
+            VkDeviceSize cap = scr + scr / 2 + 65536;
             if (!MakeBuffer(la.scratch, cap, kScr, kGpu)) return false;
             la.scratchCap = cap;
         }
         bg.dstAccelerationStructure = la.as;
         bg.scratchData.deviceAddress = (la.scratch.addr + 255) & ~VkDeviceAddress(255);
+        const BlasHist* src = envNoRefit ? nullptr : FindRefitSource(reqIdx, slot, prims);
+        BlasHist h; h.prims = prims; h.as = la.as;
+        if (src) {
+            bg.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+            bg.srcAccelerationStructure = src->as;
+            h.refits = src->refits + 1;
+            g_statRefits++;
+        } else g_statBuilds++;
+        hist.push_back(std::move(h));
         fb.pr[b] = ranges.data();
         fb.light[b] = l;
         fb.count++;
@@ -526,6 +561,10 @@ static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb) {
         aci.buffer = sl.tlasBuf.buf; aci.size = ts.accelerationStructureSize; aci.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
         if (vkCreateAccelerationStructureKHR_(g_dev, &aci, nullptr, &sl.tlas) != VK_SUCCESS) { LinkFail("TLAS create"); return false; }
     }
+    g_hist[slot] = std::move(hist);
+    g_histReq[slot] = reqIdx;
+    if (((g_statBuilds + g_statRefits) % 3000u) < fb.count && fb.count)
+        Log("BLAS: %llu refits, %llu full builds so far", (unsigned long long)g_statRefits, (unsigned long long)g_statBuilds);
     return true;
 }
 
@@ -773,7 +812,7 @@ static void Serve(HANDLE parentProc) {
             if (trace) {
                 for (uint32_t c = 0; c < g.casterCount && trace; c++)
                     trace = g.casters[c].triCount > 0 && g.casters[c].firstTri + g.casters[c].triCount <= g.triCount;
-                if (trace && !EnsureSlotBuffers(sl, g, fb)) break;
+                if (trace && !EnsureSlotBuffers(sl, g, fb, s, next >> 1)) break;
                 trace = trace && fb.count > 0;
             }
             if (trace) {
@@ -819,10 +858,13 @@ static void Serve(HANDLE parentProc) {
             if (trace) {
                 VkBufferCopy cp = { 0, 0, VkDeviceSize(g.triCount) * 36 };
                 vkCmdCopyBuffer_(cbB, sl.staging.buf, sl.verts.buf, 1, &cp);
+                // the copy, and earlier requests' BLAS builds (refit sources; also their reads of a BLAS this
+                // build now overwrites) -> this build
                 VkMemoryBarrier vb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-                vb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                vb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-                vkCmdPipelineBarrier_(cbB, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &vb, 0, nullptr, 0, nullptr);
+                vb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                vb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                vkCmdPipelineBarrier_(cbB, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &vb, 0, nullptr, 0, nullptr);
                 vkCmdBuildAccelerationStructuresKHR_(cbB, fb.count, fb.bg, fb.pr);
                 AsBarrier(cbB, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
                 VkAccelerationStructureGeometryKHR tg = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };

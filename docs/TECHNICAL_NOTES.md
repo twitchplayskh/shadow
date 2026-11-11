@@ -430,3 +430,33 @@ Next: B2 = shared images (depth in, shadow mask out) + timeline semaphore handsh
   RegisterHotKey(MOD_ALT, VK_TAB) and SPI_SCREENSAVERRUNNING=1; all three calls (and the SPI reset at exit) are
   replaced by "add esp,16; xor eax,eax". Topmost only while focused in both screen modes; the DirectInput
   keyboard state is cleared while the game window is not in the foreground.
+
+# 0.19.0: CRISP TEXT, town walls
+- Text sheets (d3d9_sod_crisp.cpp): the game's texture table (SoDFix_GetTextureTable, 40-byte entries, D3D8 texture
+  at +0x10 -> DXVK_SoD_D3D9Texture) is read once per frame for the listed ids: 77 (fonte_all / fontu_all), 488
+  (timefont), 978 (placename), 833 (ccs_font) and every id of `text_textures.txt` (menu line: all; a file's line:
+  only its page id, the first number). In DrawPrimitive / DrawIndexedPrimitive / DrawPrimitiveUP /
+  DrawIndexedPrimitiveUP, a draw whose stage 0 holds one of them gets the redrawn sheet instead (MANAGED A8R8G8B8,
+  full mip chain, LINEAR/LINEAR/LINEAR, MAXMIPLEVEL 0) and the game's texture back afterwards. Built on first use
+  (K = min(8, 2048 / largest side)), re-read every 120 frames and rebuilt only if the pixels changed; sheets not
+  used for a while are released once the total passes 384 MB.
+- Kinds: the four font ids: letter core = alpha x smoothstep((luminance - 0.30) / 0.45) (dark outline -> 0);
+  `SoDFix\crisp\<id>.a8` (u32 width, u32 height, coverage bytes, whole page at 8x) used where it matches,
+  matched in 64-row bands by correlation with the core (> 0.6), so fontu_all's 128x128 texture (main letters only)
+  takes rows 128..255 of the 128x256 page; otherwise the core is smoothed (gaussian 0.5), Catmull-Rom enlarged and
+  cut at 0.48 with a one-texel edge from the local slope. Other sheets: halo = dark pixels (alpha > 0.3,
+  luminance < 0.3) within 2 px of a white core pixel / core count; outlined lettering if halo > 0.8, coloured
+  opaque art < 2%, largest opaque 4-connected patch < 1500 px, opaque < 35% -> core with the letters' own colour,
+  sharp enlargement; else the whole sheet, premultiplied, sharp enlargement (per channel Catmull-Rom, then
+  lo + (hi - lo) * S(S(t)) over the 2x2 source neighbourhood where hi - lo > 0.02). Decision logged once per sheet.
+- The subtitle font in game is fontu_all (128x128, main set only). The game spaces letters from its own width
+  table; the redrawn letters keep each original letter's left edge and baseline (Inter Medium at the sheet's cap
+  height of 11 px, 0.95 horizontal, narrowed if wider than the original, descenders kept inside the 14-row cell).
+- Subtitle band: quads (XYZRHW | DIFFUSE | TEX1) of sheet 77 with every vertex below 60% of the viewport are
+  collected per frame; at the first such draw of the next frame a 128x32 soft rectangle (smoothstep 22% / 45% edges)
+  is drawn under them, line height x 0.9 / x 0.45 padding, alpha 0.42 x the text's own vertex alpha, through
+  DrawIndexedPrimitiveUP inside a D3DSBT_ALL state block (Capture / Apply).
+- Walls: the survey (`wall survey` warnings) showed the town's buildings on pages 4401..4443 and 885, none listed;
+  106 wall images added from them (243 in total). The 32-group limit per draw is gone (any number of wall faces).
+  Tried and reverted: keeping only images whose edges meet when repeated (it put most town walls back to the
+  game's look) and merging facings within 6 degrees.

@@ -7,5 +7,8 @@ EXPORTS
     SoDFix_GetCinematicBars
     SoDFix_GetAmbientOcclusion
     SoDFix_GetReflections
+    SoDFix_GetTextureUpscaling
+    SoDFix_GetImprovedGeometry
+    SoDFix_GetSmoothCamera
     SoDFix_GetTextureTable
     SoDFix_GetPresentSite

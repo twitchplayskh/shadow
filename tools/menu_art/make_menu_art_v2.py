@@ -3,16 +3,16 @@
 #    texture (+0x04), so the game's texture size and every existing rect's UVs stay the same
 #  - every new rect is checked against ALL game rects of its texture (0.10.0 put art inside rects 0x40,
 #    0x4D, 0x4E - visible as a second help line above "UP and DOWN")
-import sys, json, struct; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+import sys, json, struct; sys.path.insert(0,'/home/claude/sod/scripts')
 from tbn2 import *
 import itemfont as F
 import numpy as np, pefile
 from PIL import Image, ImageDraw, ImageFont
 F.G['G']=(193,210,443,473)
 F.G['X']=(116,131,0,32)                      # from the game's EXIT label
-SRC='work/assets/option_e_v096_backup.tbn2'
-OUT='../../sodfix/data/option_e.tbn2'
-pe=pefile.PE('work/shadow.exe'); img=pe.get_memory_mapped_image()
+SRC='/home/claude/sod/assets/option_e_v096_backup.tbn2'
+OUT='/home/claude/sod/SoDFix/dist/SoDFix/option_e.tbn2'
+pe=pefile.PE('/home/claude/sod/shadow.exe'); img=pe.get_memory_mapped_image()
 game={}
 for i in range(0x5d):
     t,p,u,v,w,h=struct.unpack_from('<HHhhhh',img,0x939450-0x400000+i*12)
@@ -79,10 +79,10 @@ def helpcols(text):
 
 out={}
 # ---- image 7: existing art kept (checked), RAY TRACING title replaced in place
-mode=json.load(open('work/assets/mode_rects.json'))
+mode=json.load(open('/home/claude/sod/assets/mode_rects.json'))
 for k,r in mode.items():
     if k!='WINDOWED': keep(819,k,r['u'],r['v'],r['w'],r['h'])
-rt=json.load(open('work/assets/rt_row_rects.json'))
+rt=json.load(open('/home/claude/sod/assets/rt_row_rects.json'))
 keep(819,'ULTRA',rt['ULTRA']['u'],rt['ULTRA']['v'],rt['ULTRA']['w'],rt['ULTRA']['h'])
 hr=rt['help_rt']
 erase(ix7,hr['u'],hr['v']+18,hr['w'],hr['h']-18)   # ink only in rows 0..15; 18-row rect stays clear of rect 0x4F
@@ -112,7 +112,7 @@ for y0,h,names in bands:
 set_indices(d,r7,ix7)
 
 # ---- image 8 (tex 887): our resolution labels; 1440 x 1080 overlapped game rect 0x22 -> move it
-res=json.load(open('work/assets/new_rects.json'))
+res=json.load(open('/home/claude/sod/assets/new_rects.json'))
 busy8=np.zeros((512,512),bool)
 for (i,u,v,w,h) in game[887]: busy8[max(v,0):v+h,max(u,0):u+w]=True
 A8=np.array([c[3] for c in palette(bytes(d),r8)]); arr8=np.array(ix8).reshape(512,512)
@@ -172,20 +172,52 @@ t=item7(F.compose('REFLECTIONS')); a_,b_=crop_rows(t); out['REFLECTIONS']=place1
 out['help_ssr']=place10('help_ssr',helpcols('Reflections on polished floors'),0,24,20,2,0)
 # 0.13.2: DRAW DISTANCE EXTRA, full 32-row cell like the game's LOW / MIDDLE / HIGH rects (0x59..0x5B)
 out['EXTRA']=place10('EXTRA',item7(F.compose('EXTRA')),0,48,32,1,0)
+# 0.15.0: SURFACE DEPTH (relief mapping on cobbles and paving)
+t=item7(F.compose('SURFACE DEPTH')); a_,b_=crop_rows(t); out['SURFACE_DEPTH']=place10('SURFACE_DEPTH',t,0,84,b_-a_,5,a_)
+out['help_relief']=place10('help_relief',helpcols('Depth on cobbles and paving stones'),0,108,20,2,0)
+# 0.17.0: TEXTURE UPSCALING (OFF from the game's rects, 2X / 3X / 4X full 32-row cells like EXTRA)
+t=item7(F.compose('TEXTURE UPSCALING')); a_,b_=crop_rows(t); out['TEXTURE_UPSCALING']=place10('TEXTURE_UPSCALING',t,0,132,b_-a_,5,a_)
+out['help_up']=place10('help_up',helpcols('Sharper, more detailed textures'),0,162,20,2,0)
+# the item font has old-style figures (a small 2, a descending 4) and no 3: lining digits from Belleza (OFL,
+# assets/fonts), sized to the item font's cap height and set on its baseline, then the game's own X
+def valuecols(text):
+    g=F.glyph('E'); rows=[y for y in range(F.LH) if any(F.A[c[y]]>=100 for c in g)]; top,bot=min(rows),max(rows)
+    for size in range(10,40):
+        ft=ImageFont.truetype('/home/claude/sod/assets/fonts/Belleza-Regular.ttf',size)
+        if ft.getbbox('4')[3]-ft.getbbox('4')[1]>=bot-top+1: break
+    digits=text[:-1]
+    tw=int(ft.getlength(digits))+2
+    im=Image.new('L',(tw,F.LH),0); ImageDraw.Draw(im).text((1,bot+1-ft.getbbox('4')[3]),digits,fill=255,font=ft)
+    cols=[[to7(im.getpixel((x,y))) if im.getpixel((x,y))>24 else 0 for y in range(F.LH)] for x in range(tw)]
+    return cols+[[0]*F.LH]+item7(F.compose('X'))
+out['V2X']=place10('V2X',valuecols('2X'),0,186,32,1,0)
+out['V3X']=place10('V3X',valuecols('3X'),64,186,32,1,0)
+out['V4X']=place10('V4X',valuecols('4X'),128,186,32,1,0)
+# 0.18.0: IMPROVED GEOMETRY (ON / OFF from the game's rects). The item font has no V: the left half of its W
+_glyph=F.glyph
+def _glyph_v(ch):
+    if ch=='V': return [list(c) for c in _glyph('W')[:13]]
+    return _glyph(ch)
+F.glyph=_glyph_v
+t=item7(F.compose('IMPROVED GEOMETRY')); a_,b_=crop_rows(t); out['IMPROVED_GEOMETRY']=place10('IMPROVED_GEOMETRY',t,0,222,b_-a_,5,a_)
+out['help_geom']=place10('help_geom',helpcols('Seamless streets, no repeating tiles'),0,252,20,2,0)
+# 0.18.6: SMOOTH CAMERA (DISPLAY SETTING; ON / OFF from the game's rects, like CINEMATIC BARS)
+t=item7(F.compose('SMOOTH CAMERA')); a_,b_=crop_rows(t); out['SMOOTH_CAMERA']=place10('SMOOTH_CAMERA',t,0,276,b_-a_,5,a_)
+out['help_sc']=place10('help_sc',helpcols('Steadier camera while walking'),0,306,20,2,0)
 grp[r7['px']-g0:r7['px']-g0+r7['npix']]=bytes(ix10)
 last=parse(bytes(d))[-1]; endlast=last['pal']+(4<<last['bpp'])
 assert struct.unpack_from('<I',d,endlast)[0]==0, 'no terminator after the last group'
 d[endlast:endlast]=grp
 assert len(parse(bytes(d)))==11
 open(OUT,'wb').write(d)
-json.dump(out,open('work/assets/menu_v2_rects.json','w'),indent=1)
-json.dump(newres,open('work/assets/new_rects_v2.json','w'),indent=1)
+json.dump(out,open('/home/claude/sod/assets/menu_v2_rects.json','w'),indent=1)
+json.dump(newres,open('/home/claude/sod/assets/new_rects_v2.json','w'),indent=1)
 print(json.dumps(out)); print(newres)
-im=decode(bytes(d),r7); bg=Image.new('RGBA',im.size,(40,40,40,255)); bg.alpha_composite(im); bg.save('work/tmp/opt7_v2.png')
-im=decode(bytes(d),r8); bg=Image.new('RGBA',im.size,(120,100,80,255)); bg.alpha_composite(im); bg.save('work/tmp/opt8_v2.png')
+im=decode(bytes(d),r7); bg=Image.new('RGBA',im.size,(40,40,40,255)); bg.alpha_composite(im); bg.save('/tmp/opt7_v2.png')
+im=decode(bytes(d),r8); bg=Image.new('RGBA',im.size,(120,100,80,255)); bg.alpha_composite(im); bg.save('/tmp/opt8_v2.png')
 
 # ---- C header for SoDFix: every rect of ours
-with open('../../sodfix/src/menu_art.h','w') as f:
+with open('/home/claude/sod/SoDFix/src/menu_art.h','w') as f:
     f.write('// generated by scripts/make_menu_art_v2.py - SoDFix menu art in option_e.tbn2 (tex, pal, u, v, w, h; yoff)\n#pragma once\n')
     pal={819:13226,887:13991,4999:21999}
     for k,r in out.items():

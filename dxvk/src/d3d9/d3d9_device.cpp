@@ -1,4 +1,6 @@
 #include "d3d9_device.h"
+#include <fstream>
+#include <sstream>
 
 #include "d3d9_annotation.h"
 #include "d3d9_common_texture.h"
@@ -1963,7 +1965,7 @@ namespace dxvk {
     m_sodRt.OnClear(Flags);
     if (m_sodLog.left) { m_sodLog.clears++; m_sodLog.clearFlags |= Flags; if (Flags & D3DCLEAR_TARGET) m_sodLog.clearColor = Color; }
     if (unlikely(m_sodLink != nullptr) && (Flags & D3DCLEAR_STENCIL) && SodLinkActive()) m_sodLink->OnClearStencil();
-    if (Flags & D3DCLEAR_ZBUFFER) { m_sodAoSeen3D = false; m_sodSsrDraws.clear(); }   // a new 3D scene starts
+    if (Flags & D3DCLEAR_ZBUFFER) { m_sodAoSeen3D = false; m_sodSsrDraws.clear(); m_sodRelDraws.clear(); }   // a new 3D scene starts
     if (unlikely(m_sodRt.Dumping())) {
       struct { uint32_t count, flags, color; float z; uint32_t stencil; SodSurfInfo rt0, ds; } e = { Count, Flags, Color, Z, Stencil,
         SodSurf(m_state.renderTargets[0].ptr()), SodSurf(m_state.depthStencil.ptr()) };
@@ -2143,6 +2145,10 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) {
+    if (State == D3DTS_VIEW) {
+      D3D9DeviceLock lock = LockDevice();
+      if (!ShouldRecord()) pMatrix = SodSmoothCamView(pMatrix);           // SMOOTH CAMERA (d3d9_sod_smoothcam.cpp)
+    }
     return SetStateTransform(GetTransformIndex(State), pMatrix);
   }
 
@@ -3091,10 +3097,20 @@ namespace dxvk {
           UINT             StartVertex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+    SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
 
+    if (sodCrisp.id == 77) {                         // subtitle text: faint backing band first
+      const D3D9VBO& vbo = m_state.vertexBuffers[0];
+      D3D9CommonBuffer* vb = GetCommonBuffer(vbo.vertexBuffer);
+      const UINT n = GetVertexCount(PrimitiveType, PrimitiveCount);
+      if (vb && vb->GetMappedSlice() && vb->GetMappedSlice()->mapPtr()
+          && size_t(vbo.offset) + size_t(StartVertex + n) * vbo.stride <= vb->Desc()->Size)
+        SodBandObserve(static_cast<const uint8_t*>(vb->GetMappedSlice()->mapPtr()) + vbo.offset + size_t(StartVertex) * vbo.stride, vbo.stride, n);
+      SodBandDraw();
+    }
     if (unlikely(m_sodBarsOff) && SodIsLetterboxBar(PrimitiveType, StartVertex, PrimitiveCount))
       return D3D_OK;                                  // CINEMATIC BARS OFF: the scene underneath is full height
     SodFrameLogDraw();
@@ -3120,6 +3136,7 @@ namespace dxvk {
     int32_t baseVertexIndex = 0;
     uint32_t vertexCount    = GetVertexCount(PrimitiveType, PrimitiveCount);
 
+    if (unlikely(!m_sodGeomMap.empty())) SodGeomSurvey("non-indexed draw", PrimitiveType, 0, 0, 0, StartVertex, PrimitiveCount, false);
     if (sod::ShaderKind kind = SodCasterKind(); kind != sod::ShaderKind::None)
       SodCaptureCaster(kind, PrimitiveType, PrimitiveCount, StartVertex, 0, vertexCount, 0, false);
 
@@ -3162,6 +3179,7 @@ namespace dxvk {
           UINT             StartIndex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+    SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
@@ -3180,7 +3198,9 @@ namespace dxvk {
     SodAoObserve();                                  // after the RT shadow pass of the same draw
     if (!sodGuard.dev && SodAoMarkDraw(1)) sodGuard.Begin(this);   // AO: characters don't receive it
     SodFogLog();
+    if (unlikely(m_sodCamFile != nullptr)) SodCamObserve();
     if (unlikely(!m_sodSsrMap.empty())) SodSsrRecord(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
+    if (unlikely(!m_sodRelMap.empty())) SodReliefRecord(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
     SodDecalGuard sodDecal;
     if (unlikely(m_sodSsrDecals) && SodIsFloorDecal(BaseVertexIndex, MinVertexIndex, NumVertices, PrimitiveCount)) sodDecal.Begin(this);
 
@@ -3188,13 +3208,29 @@ namespace dxvk {
     if (unlikely(!PrimitiveCount || !NumVertices))
       return D3D_OK;
 
+    if (sod::ShaderKind kind = SodCasterKind(); kind != sod::ShaderKind::None)
+      SodCaptureCaster(kind, PrimitiveType, PrimitiveCount, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, true);
+
+    if (unlikely(!m_sodGeomMap.empty())) SodGeomSurvey("indexed draw", PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount, true);
+    if (unlikely(!m_sodGeomMap.empty()) && SodGeomDraw(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount))
+      return D3D_OK;                                 // drawn as ground (seamless) + the rest (d3d9_sod_geom.cpp)
+
+    return SodDrawIndexedRaw(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
+  }
+
+
+  // the plain indexed draw, without the SoD observers (used by DrawIndexedPrimitive and improved geometry)
+  HRESULT D3D9DeviceEx::SodDrawIndexedRaw(
+          D3DPRIMITIVETYPE PrimitiveType,
+          INT              BaseVertexIndex,
+          UINT             MinVertexIndex,
+          UINT             NumVertices,
+          UINT             StartIndex,
+          UINT             PrimitiveCount) {
     bool dynamicSysmemVBOs = false;
     bool dynamicSysmemIBO = false;
 
     uint32_t indexCount = GetVertexCount(PrimitiveType, PrimitiveCount);
-
-    if (sod::ShaderKind kind = SodCasterKind(); kind != sod::ShaderKind::None)
-      SodCaptureCaster(kind, PrimitiveType, PrimitiveCount, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, true);
 
     UploadPerDrawData(MinVertexIndex, NumVertices, StartIndex, indexCount,
       BaseVertexIndex, &dynamicSysmemVBOs, &dynamicSysmemIBO);
@@ -3245,6 +3281,7 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+    SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(!VertexStreamZeroStride))
       return D3DERR_INVALIDCALL;
@@ -3252,6 +3289,10 @@ namespace dxvk {
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
 
+    if (sodCrisp.id == 77) {                         // subtitle text: faint backing band first
+      SodBandObserve(static_cast<const uint8_t*>(pVertexStreamZeroData), VertexStreamZeroStride, GetVertexCount(PrimitiveType, PrimitiveCount));
+      SodBandDraw();
+    }
     SodFrameLogDraw();
     m_sodRt.OnAnyDraw(m_state.vertexShader.ptr(), m_state.vertexDecl ? m_state.vertexDecl->GetFVF() : 0u, "DrawPrimitiveUP",
       uint32_t(PrimitiveType), PrimitiveCount, m_state.renderStates[D3DRS_STENCILENABLE] != FALSE,
@@ -3320,6 +3361,7 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+    SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(!VertexStreamZeroStride))
       return D3DERR_INVALIDCALL;
@@ -3327,11 +3369,11 @@ namespace dxvk {
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
 
-    SodFrameLogDraw();
-    m_sodRt.OnAnyDraw(m_state.vertexShader.ptr(), m_state.vertexDecl ? m_state.vertexDecl->GetFVF() : 0u, "DrawIndexedPrimitiveUP",
+    if (!m_sodInternal) SodFrameLogDraw();
+    if (!m_sodInternal) m_sodRt.OnAnyDraw(m_state.vertexShader.ptr(), m_state.vertexDecl ? m_state.vertexDecl->GetFVF() : 0u, "DrawIndexedPrimitiveUP",
       uint32_t(PrimitiveType), PrimitiveCount, m_state.renderStates[D3DRS_STENCILENABLE] != FALSE,
       m_state.renderStates[D3DRS_STENCILPASS], m_state.renderStates[D3DRS_COLORWRITEENABLE]);
-    if (unlikely(m_sodRt.Dumping())) SodDumpDraw(3, PrimitiveType, PrimitiveCount, 0, MinVertexIndex, NumVertices, 0, pVertexStreamZeroData, VertexStreamZeroStride, pIndexData, IndexDataFormat);
+    if (unlikely(m_sodRt.Dumping()) && !m_sodInternal) SodDumpDraw(3, PrimitiveType, PrimitiveCount, 0, MinVertexIndex, NumVertices, 0, pVertexStreamZeroData, VertexStreamZeroStride, pIndexData, IndexDataFormat);
     SodMarkGuard sodGuard;
     if (unlikely(m_sodLink != nullptr)) {
       int a = SodLinkObserveDraw(3, PrimitiveType, PrimitiveCount, 0, MinVertexIndex, NumVertices, 0, pVertexStreamZeroData, VertexStreamZeroStride);
@@ -3749,6 +3791,14 @@ namespace dxvk {
     const float* pConstantData,
           UINT   Vector4fCount) {
     D3D9DeviceLock lock = LockDevice();
+
+    // SMOOTH CAMERA: a view * projection in c0..c3 follows the smoothed camera (d3d9_sod_smoothcam.cpp)
+    if (unlikely(m_sodScActive) && StartRegister == 0 && Vector4fCount >= 4 && pConstantData && !ShouldRecord()) {
+      std::vector<float>& tmp = m_sodScConst;
+      tmp.assign(pConstantData, pConstantData + size_t(Vector4fCount) * 4);
+      if (SodSmoothCamConstants(pConstantData, tmp.data()))
+        return SetShaderConstants<D3D9ShaderType::VertexShader, D3D9ConstantType::Float>(StartRegister, tmp.data(), Vector4fCount);
+    }
 
     return SetShaderConstants<
       D3D9ShaderType::VertexShader,
@@ -4392,6 +4442,11 @@ namespace dxvk {
     m_sodBarsOff = m_sodRt.CinematicBars() == 0;
     m_sodAoSeen3D = false; m_sodAoDone = false;
     SodSsrFrame();
+    SodReliefFrame();
+    SodSrFrame();
+    SodGeomFrame();
+    SodCamFrame();
+    m_sodScFrameSet = false;                         // SMOOTH CAMERA: the next view matrix starts a new frame
     { int tf = m_sodRt.TextureFiltering();             // TEXTURE FILTERING changed: rebind every sampler
       if (tf != m_sodTexFilter) {
         m_sodTexFilter = tf;
@@ -5444,6 +5499,15 @@ namespace dxvk {
     VkOffset3D mip0Offset = { int32_t(box.Left), int32_t(box.Top), int32_t(box.Front) };
     VkOffset3D offset = util::computeMipLevelOffset(mip0Offset, subresource.mipLevel);
 
+    if (pResource->SodScale() > 1u) {
+      // SoD: the image is bigger than the texture; the whole top level goes through the upscaler
+      if (subresource.mipLevel == 0 && SodUpscaleUpload(pResource, Subresource)) {
+        if (pResource->IsAutomaticMip())
+          MarkTextureMipsDirty(pResource);
+      }
+      return D3D_OK;
+    }
+
     UpdateTextureFromBuffer(pResource, pResource, Subresource, Subresource, offset, extent, offset);
 
     if (pResource->IsAutomaticMip())
@@ -5451,6 +5515,193 @@ namespace dxvk {
 
     return D3D_OK;
   }
+
+  bool D3D9DeviceEx::SodIsTextTexture(D3D9CommonTexture* pResource) {
+    // game textures that hold text (SoDFix\text_textures.txt: texture table indices): looked up through the table
+    if (!m_sodTextTried) {
+      m_sodTextTried = true;
+      char path[MAX_PATH] = { };
+      ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+      if (char* s = std::strrchr(path, '\\')) s[1] = 0;
+      std::ifstream f(std::string(path) + "SoDFix\\text_textures.txt");
+      std::string line;
+      while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line); int id;
+        while (ss >> id) if (id >= -16384 && id <= 16383) m_sodTextIds.push_back(id);
+      }
+      HMODULE fix = ::GetModuleHandleA("dinput8.dll"), d3d8 = ::GetModuleHandleA("d3d8.dll");
+      if (fix && !m_sodSsrGetTable) m_sodSsrGetTable = reinterpret_cast<uintptr_t(*)()>(::GetProcAddress(fix, "SoDFix_GetTextureTable"));
+      if (d3d8 && !m_sodSsrTex9) m_sodSsrTex9 = reinterpret_cast<void*(__stdcall*)(void*)>(::GetProcAddress(d3d8, "DXVK_SoD_D3D9Texture"));
+      Logger::info(str::format("SoD-RT: texture upscaling: ", m_sodTextIds.size(), " text texture ids",
+        (m_sodSsrGetTable && m_sodSsrTex9) ? "" : " (no texture table: text not recognised)"));
+    }
+    if (m_sodTextIds.empty() || !m_sodSsrGetTable || !m_sodSsrTex9) return false;
+    const uintptr_t table = m_sodSsrGetTable();
+    if (!table) return false;
+    for (int id : m_sodTextIds) {
+      void* t8 = *reinterpret_cast<void* const*>(table + intptr_t(id) * 40 + 0x10);
+      if (!t8) continue;
+      void* t9 = m_sodSsrTex9(t8);
+      if (t9 && static_cast<D3D9Texture2D*>(static_cast<IDirect3DTexture9*>(t9))->GetCommonTexture() == pResource) {
+        if (m_sodTextLogged.insert(id).second)
+          Logger::info(str::format("SoD-RT: texture upscaling: text texture ", id, " kept plain"));
+        return true;
+      }
+    }
+    return false;
+  }
+
+
+  bool D3D9DeviceEx::SodUpscaleUpload(D3D9CommonTexture* pResource, UINT Subresource) {
+    if (!m_sodUp && !m_sodUpFailed) {
+      try { m_sodUp = std::make_unique<sod::UpscalePass>(m_dxvkDevice); }
+      catch (const DxvkError& e) { Logger::err(str::format("SoD-RT: texture upscaling unavailable: ", e.message())); m_sodUpFailed = true; }
+    }
+    if (!m_sodUp) return false;     // (image stays black at the bigger size: should not happen, logged once)
+    ThrottleAllocation();
+    const Rc<DxvkImage> image = pResource->GetImage();
+    auto formatInfo = lookupFormatInfo(pResource->GetFormatMapping().Format);
+    const VkExtent3D ext = pResource->GetExtent();
+    const uint32_t code = sod::UpscalePass::FormatCode(pResource->GetFormatMapping().Format);
+    if (code == ~0u) return false;
+    const uint32_t scale = pResource->SodScale();
+    const VkDeviceSize pitch = align(ext.width * formatInfo->elementSize, 4);
+    const VkDeviceSize bytes = VkDeviceSize(ext.width) * ext.height * formatInfo->elementSize;
+    const void* mapPtr = MapTexture(pResource, Subresource);
+    if (!mapPtr) return false;
+    D3D9BufferSlice slice = AllocStagingBuffer(align(bytes, 4));
+    util::packImageData(slice.mapPtr, mapPtr, VkExtent3D { ext.width, ext.height, 1u }, formatInfo->elementSize,
+      pitch, pitch * ext.height);
+    TrackTextureMappingBufferSequenceNumber(pResource, Subresource);
+    const D3D9Format f = pResource->Desc()->Format;
+    const bool opaque = f == D3D9Format::X8R8G8B8 || f == D3D9Format::X1R5G5B5 || f == D3D9Format::R5G6B5;
+    auto token = pResource->SodToken();
+    token->gen++; token->uploads++;
+    m_sodUpCount++;
+
+    // text: plain enlargement, never the upscaler or the network
+    if (SodIsTextTexture(pResource)) {
+      m_sodUp->Upload(this, slice.slice, align(bytes, 4), ext.width, ext.height, scale, code, opaque, image, true);
+      return true;
+    }
+
+    // super-resolved before (this session or an earlier one): straight from the cache, no pop-in
+    if (!m_sodCache) m_sodCache = std::make_unique<sod::TexCache>();
+    const uint32_t ow = ext.width * scale, oh = ext.height * scale;
+    const VkDeviceSize outBytes = code <= 1u ? VkDeviceSize(ow) * oh * 4u : VkDeviceSize(ow) * oh * 2u;
+    const uint64_t key = sod::TexCache::Key(slice.mapPtr, size_t(bytes), ext.width, ext.height, code, scale, opaque);
+    if (m_sodCache->Enabled()) {
+      std::vector<uint8_t> data;
+      if (m_sodCache->Load(key, size_t(outBytes), data)) {
+        D3D9BufferSlice up = AllocStagingBuffer(align(outBytes, 4));
+        std::memcpy(up.mapPtr, data.data(), data.size());
+        sod::UpscalePass::UploadPacked(this, up.slice, ow, oh, image);
+        m_sodCacheHits++;
+        return true;
+      }
+    }
+
+    m_sodUp->Upload(this, slice.slice, align(bytes, 4), ext.width, ext.height, scale, code, opaque, image);
+    SodSrEnqueue(pResource, slice.mapPtr, bytes, code, opaque, key, outBytes);
+    if ((m_sodUpCount % 500u) == 1u)
+      Logger::info(str::format("SoD-RT: texture upscaling: ", m_sodUpCount, " uploads, ", m_sodCacheHits, " from the cache (last ",
+        ext.width, "x", ext.height, " -> ", ow, "x", oh, ")"));
+    return true;
+  }
+
+
+  void D3D9DeviceEx::SodSrEnqueue(D3D9CommonTexture* pResource, const void* texels, VkDeviceSize bytes, uint32_t format, bool opaque,
+                                  uint64_t key, VkDeviceSize outBytes) {
+    static const int envSr = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_SR", v, 8) ? std::atoi(v) : -1; }();
+    if (envSr == 0) return;
+    if (!m_sodSrTried) {
+      m_sodSrTried = true;
+      char path[MAX_PATH] = { };
+      ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+      if (char* s = std::strrchr(path, '\\')) s[1] = 0;
+      const std::string file = std::string(path) + "SoDFix\\sr_weights.bin";
+      std::vector<float> w; std::vector<sod::SrLayer> l;
+      if (!sod::SrPass::LoadWeights(file, w, l)) Logger::warn(str::format("SoD-RT: texture super-resolution off (", file, " missing or invalid)"));
+      else {
+        try { m_sodSr = std::make_unique<sod::SrPass>(m_dxvkDevice, w, l); }
+        catch (const DxvkError& e) { Logger::err(str::format("SoD-RT: texture super-resolution unavailable: ", e.message())); }
+      }
+    }
+    if (!m_sodSr) return;
+    const VkExtent3D ext = pResource->GetExtent();
+    if (VkDeviceSize(ext.width) * ext.height > sod::SrPass::kMaxSrcTexels) return;
+    auto token = pResource->SodToken();
+    if (token->uploads > 3u) return;                   // changed again and again (animated): edge-directed only
+    for (auto it = m_sodSrQueue.begin(); it != m_sodSrQueue.end(); ++it)
+      if (it->layer < 0 && it->token.lock() == token) { m_sodSrQueue.erase(it); break; }
+    SodSrJob j;
+    j.token = token; j.gen = token->gen; j.tex = pResource; j.image = pResource->GetImage();
+    j.texels.assign(static_cast<const uint8_t*>(texels), static_cast<const uint8_t*>(texels) + bytes);
+    j.w = ext.width; j.h = ext.height; j.scale = pResource->SodScale(); j.format = format; j.opaque = opaque;
+    j.key = key; j.outBytes = outBytes;
+    m_sodSrQueue.push_back(std::move(j));
+  }
+
+
+  void D3D9DeviceEx::SodSrFrame() {
+    // finished results on their way to the disk cache
+    for (auto it = m_sodSrReadbacks.begin(); it != m_sodSrReadbacks.end(); ) {
+      if (m_csThread.lastSequenceNumber() >= it->seq && !it->buffer->isInUse(DxvkAccess::Write)) {
+        const uint8_t* p = static_cast<const uint8_t*>(it->buffer->mapPtr(0));
+        if (p && m_sodCache) m_sodCache->Store(it->key, std::vector<uint8_t>(p, p + it->bytes));
+        it = m_sodSrReadbacks.erase(it);
+      } else ++it;
+    }
+    // run queued textures through the network within a budget of pixel-layers per frame: smallest first (they
+    // finish in the frame after they appear), more while a lot is waiting (an area is loading)
+    if (!m_sodSr || m_sodSrQueue.empty()) return;
+    static const int64_t envBudget = [] { char v[16] = { }; return ::GetEnvironmentVariableA("SODRT_SR_BUDGET", v, 16) ? int64_t(std::atoll(v)) : int64_t(0); }();
+    const uint32_t layers = m_sodSr->LayerCount();
+    int64_t pending = 0;
+    for (const auto& q : m_sodSrQueue) pending += int64_t(q.w) * q.h * (int64_t(layers) - std::max(q.layer, 0));
+    // per frame: 4X 1.5M pixel-layers, 3X 1.0M, 2X 0.6M (SODRT_SR_BUDGET overrides)
+    const int level = SodUpscaleLevel();
+    int64_t budget = envBudget > 0 ? envBudget : level >= 3 ? int64_t(1500000) : level == 2 ? int64_t(1000000) : int64_t(600000);
+    if (pending > 6000000) budget *= 3;
+    while (budget > 0 && !m_sodSrQueue.empty()) {
+      if (m_sodSrQueue.front().layer < 0) {                // pick the smallest waiting texture
+        auto best = m_sodSrQueue.begin();
+        for (auto it = m_sodSrQueue.begin(); it != m_sodSrQueue.end(); ++it)
+          if (it->layer < 0 && uint64_t(it->w) * it->h < uint64_t(best->w) * best->h) best = it;
+        if (best != m_sodSrQueue.begin()) std::iter_swap(m_sodSrQueue.begin(), best);
+      }
+      SodSrJob& j = m_sodSrQueue.front();
+      auto token = j.token.lock();
+      if (!token || token->gen != j.gen) { m_sodSrQueue.pop_front(); continue; }     // texture gone or uploaded again
+      const int64_t N = int64_t(j.w) * j.h;
+      if (j.layer < 0) {
+        D3D9BufferSlice slice = AllocStagingBuffer(align(VkDeviceSize(j.texels.size()), 4));
+        std::memcpy(slice.mapPtr, j.texels.data(), j.texels.size());
+        m_sodSr->Start(this, slice.slice, align(VkDeviceSize(j.texels.size()), 4), j.w, j.h, j.format, j.opaque);
+        std::vector<uint8_t>().swap(j.texels);
+        j.layer = 0;
+        budget -= N;
+      }
+      if (uint32_t(j.layer) < layers) {
+        const int64_t n = std::max<int64_t>(1, std::min<int64_t>(int64_t(layers) - j.layer, budget / std::max<int64_t>(N, 1)));
+        m_sodSr->Layers(this, j.w, j.h, uint32_t(j.layer), uint32_t(n));
+        j.layer += int(n);
+        budget -= n * N;
+      }
+      if (uint32_t(j.layer) >= layers) {
+        Rc<DxvkBuffer> rb;
+        if (m_sodCache && m_sodCache->Enabled()) rb = m_sodSr->MakeReadback(j.outBytes);
+        m_sodSr->Finish(this, j.w, j.h, j.scale, j.format, j.opaque, j.image, rb, j.outBytes);
+        if (rb != nullptr) m_sodSrReadbacks.push_back({ rb, j.outBytes, j.key, GetCurrentSequenceNumber() });
+        if (j.tex->IsAutomaticMip()) MarkTextureMipsDirty(j.tex);
+        if ((m_sodSrDone++ % 200u) == 0u)
+          Logger::info(str::format("SoD-RT: texture super-resolution: ", m_sodSrDone, " textures done, ", m_sodSrQueue.size() - 1, " queued"));
+        m_sodSrQueue.pop_front();
+      }
+    }
+  }
+
 
   void D3D9DeviceEx::UpdateTextureFromBuffer(
     D3D9CommonTexture* pDestTexture,
@@ -5632,6 +5883,7 @@ namespace dxvk {
       Flags &= ~D3DLOCK_DISCARD;
 
     auto& desc = *pResource->Desc();
+    if (!(Flags & D3DLOCK_READONLY)) pResource->SodBumpWriteGen();
 
     // Ignore DISCARD if NOOVERWRITE or READONLY is set
     if (unlikely((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) != D3DLOCK_DISCARD))
@@ -9456,6 +9708,11 @@ namespace dxvk {
     m_sodSsrMaskRT = m_sodSsrOutTex = nullptr;
     m_sodSsrMaskW = m_sodSsrMaskH = m_sodSsrOutW = m_sodSsrOutH = 0;
     m_sodSsrDraws.clear();
+    if (m_sodRelUvRT) static_cast<D3D9Texture2D*>(m_sodRelUvRT)->ReleasePrivate();
+    if (m_sodRelOutTex) static_cast<D3D9Texture2D*>(m_sodRelOutTex)->ReleasePrivate();
+    m_sodRelUvRT = m_sodRelOutTex = nullptr;
+    m_sodRelUvW = m_sodRelUvH = m_sodRelOutW = m_sodRelOutH = 0;
+    m_sodRelDraws.clear();
   }
 
 
@@ -9538,7 +9795,8 @@ namespace dxvk {
     if (m_sodInternal || m_sodAoDone || !m_state.vertexDecl) return;
     const bool wantAo = m_sodRt.AmbientOcclusion() > 0 && !m_sodAoFailed;
     const bool wantSsr = m_sodRt.Reflections() > 0 && !m_sodSsrFailed;
-    if (!wantAo && !wantSsr) return;
+    const bool wantRelief = m_sodRt.SurfaceDepth() > 0 && !m_sodRelFailed;
+    if (!wantAo && !wantSsr && !wantRelief) return;
     const auto& rs = m_state.renderStates;
     const uint32_t fvf = m_state.vertexDecl->GetFVF();
     const bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
@@ -9559,6 +9817,7 @@ namespace dxvk {
     }
     if (m_sodAoSeen3D && (rhw || !rs[D3DRS_ZWRITEENABLE])) {
       m_sodAoDone = true;
+      if (wantRelief) SodReliefApply();                 // ground relief first: reflections and AO see the shifted detail
       if (wantSsr) SodSsrApply();                       // reflections of the lit scene first, then the contact shading
       if (wantAo) SodAoApply();
     }
@@ -9632,7 +9891,7 @@ namespace dxvk {
     // once per frame (Present): map the d3d9 textures behind the listed texture-table entries
     m_sodSsrDraws.clear();
     m_sodAoFog[2] = 0.0f;
-    m_sodSsrDecals = !m_sodSsrFailed && m_sodRt.Reflections() > 0;
+    m_sodSsrDecals = (!m_sodSsrFailed && m_sodRt.Reflections() > 0) || (!m_sodRelFailed && m_sodRt.SurfaceDepth() > 0);
     if (m_sodSsrFailed || m_sodRt.Reflections() <= 0) return;
     if (!m_sodSsrTried) {
       m_sodSsrTried = true;
@@ -9706,7 +9965,10 @@ namespace dxvk {
     const sod::SsrEntry& e = m_sodSsrTable->Entries()[entry];
     IDirect3DTexture9* tex = nullptr;
     const UINT w = std::max<UINT>(e.pw, 1), h = std::max<UINT>(e.ph, 1);
-    if (FAILED(CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr)) || !tex) {
+    m_sodNoUpscale = true;
+    const HRESULT hrMask = CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
+    m_sodNoUpscale = false;
+    if (FAILED(hrMask) || !tex) {
       m_sodSsrPageMask[entry] = nullptr;
       return nullptr;
     }
@@ -9843,6 +10105,357 @@ namespace dxvk {
       Logger::info(str::format("SoD-RT: reflections ", level >= 2 ? "HIGH" : "LOW", " ", ext.width, "x", ext.height,
         " floor draws ", drawn, " mapped textures ", m_sodSsrMap.size()));
     SodMultiplyPass(m_sodSsr->Result(), ext.width, ext.height, false, &m_sodSsrOutTex, &m_sodSsrOutW, &m_sodSsrOutH, true);
+  }
+
+
+  // ---------------------------------------------------------------- surface depth (parallax relief, d3d9_sod_relief.h)
+
+  void D3D9DeviceEx::SodReliefFrame() {
+    // once per frame (Present): map the d3d9 textures behind the entries of relief.txt
+    m_sodRelDraws.clear();
+    if (m_sodRelFailed || m_sodRt.SurfaceDepth() <= 0) return;
+    if (!m_sodRelTried) {
+      m_sodRelTried = true;
+      char path[MAX_PATH] = { };
+      ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+      if (char* s = std::strrchr(path, '\\')) s[1] = 0;
+      m_sodRelTable = std::make_unique<sod::ReliefTable>();
+      const std::string file = std::string(path) + "SoDFix\\relief.txt";
+      HMODULE fix = ::GetModuleHandleA("dinput8.dll"), d3d8 = ::GetModuleHandleA("d3d8.dll");
+      if (fix && !m_sodSsrGetTable)  m_sodSsrGetTable = reinterpret_cast<uintptr_t(*)()>(::GetProcAddress(fix, "SoDFix_GetTextureTable"));
+      if (d3d8 && !m_sodSsrTex9) m_sodSsrTex9 = reinterpret_cast<void*(__stdcall*)(void*)>(::GetProcAddress(d3d8, "DXVK_SoD_D3D9Texture"));
+      if (!m_sodRelTable->Load(file) || !m_sodSsrGetTable || !m_sodSsrTex9) {
+        Logger::err(str::format("SoD-RT: surface depth unavailable (", file, m_sodSsrGetTable ? "" : ", no SoDFix texture table",
+          m_sodSsrTex9 ? "" : ", no d3d8 texture lookup", ")"));
+        m_sodRelFailed = true;
+        return;
+      }
+      const auto& entries = m_sodRelTable->Entries();
+      for (size_t i = 0; i < entries.size(); i++) {
+        const uint32_t first = uint32_t(m_sodRelItems.size());
+        if (entries[i].page) {
+          for (const auto& r : entries[i].regions) {
+            SodRelItem it; it.entry = int(i); it.rx = r.x; it.ry = r.y; it.rw = r.w; it.rh = r.h; it.cls = r.cls;
+            m_sodRelItems.push_back(it);
+          }
+        } else {
+          SodRelItem it; it.entry = int(i); it.cls = entries[i].cls;
+          m_sodRelItems.push_back(it);
+        }
+        m_sodRelEntryItems.emplace_back(first, uint32_t(m_sodRelItems.size()) - first);
+      }
+      m_sodRelTex8.assign(entries.size(), nullptr);
+      m_sodRelTex9Of.assign(entries.size(), nullptr);
+      Logger::info(str::format("SoD-RT: surface depth: ", entries.size(), " texture entries, ", m_sodRelItems.size(), " materials from ", file));
+    }
+    const uintptr_t table = m_sodSsrGetTable();
+    if (!table) return;
+    const auto& entries = m_sodRelTable->Entries();
+    for (size_t i = 0; i < entries.size(); i++) {
+      void* t8 = *reinterpret_cast<void* const*>(table + intptr_t(entries[i].index) * 40 + 0x10);
+      if (t8 == m_sodRelTex8[i]) continue;
+      if (m_sodRelTex9Of[i]) {
+        auto it = m_sodRelMap.find(static_cast<IDirect3DBaseTexture9*>(m_sodRelTex9Of[i]));
+        if (it != m_sodRelMap.end() && it->second == int(i)) m_sodRelMap.erase(it);
+      }
+      m_sodRelTex8[i] = t8;
+      void* t9 = t8 ? m_sodSsrTex9(t8) : nullptr;
+      m_sodRelTex9Of[i] = t9;
+      if (t9) m_sodRelMap[static_cast<IDirect3DBaseTexture9*>(static_cast<IDirect3DTexture9*>(t9))] = int(i);
+      // a different texture in this table slot (another area loaded): its maps are made again when it is drawn
+      const auto& ei = m_sodRelEntryItems[i];
+      for (uint32_t k = ei.first; k < ei.first + ei.second; k++) {
+        if (m_sodRelItems[k].tex9 == t9 && m_sodRelItems[k].ready) continue;
+        m_sodRelItems[k].ready = false; m_sodRelItems[k].failed = false;
+      }
+    }
+  }
+
+
+  void D3D9DeviceEx::SodReliefRecord(D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount) {
+    // opaque fixed-function room geometry with a listed ground texture on stage 0 (same filter as the reflections)
+    if (m_sodInternal || m_sodAoDone || m_sodRelFailed || !m_state.vertexDecl || m_state.vertexShader.ptr()) return;
+    const auto& rs = m_state.renderStates;
+    if (m_state.vertexDecl->GetFVF() != (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)) return;
+    if (!rs[D3DRS_ZENABLE] || !rs[D3DRS_ZWRITEENABLE] || rs[D3DRS_STENCILENABLE] || rs[D3DRS_ALPHABLENDENABLE]) return;
+    if (m_state.textureStages[0][DXVK_TSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) return;   // scrolling water etc.
+    auto it = m_sodRelMap.find(m_state.textures[0]);
+    if (it == m_sodRelMap.end()) return;
+    const auto& vbo = m_state.vertexBuffers[0];
+    if (!vbo.vertexBuffer.ptr() || !m_state.indices.ptr()) return;
+    if (m_sodRelDraws.size() >= 4096) return;
+    SodSsrDraw d;
+    d.vb = vbo.vertexBuffer.ptr(); d.vbOffset = vbo.offset; d.stride = vbo.stride;
+    d.ib = m_state.indices.ptr();
+    d.type = type; d.base = base; d.minIndex = minIndex; d.numVertices = numVertices; d.startIndex = startIndex; d.primCount = primCount;
+    std::memcpy(&d.world, &m_state.transforms[GetTransformIndex(D3DTS_WORLD)], 64);
+    std::memcpy(&d.view,  &m_state.transforms[GetTransformIndex(D3DTS_VIEW)], 64);
+    std::memcpy(&d.proj,  &m_state.transforms[GetTransformIndex(D3DTS_PROJECTION)], 64);
+    d.vp = m_state.viewport;
+    d.zfunc = rs[D3DRS_ZFUNC]; d.cull = rs[D3DRS_CULLMODE]; d.fvf = m_state.vertexDecl->GetFVF();
+    d.depthBias = rs[D3DRS_DEPTHBIAS]; d.slopeBias = rs[D3DRS_SLOPESCALEDEPTHBIAS];
+    d.entry = it->second;
+    m_sodRelDraws.push_back(std::move(d));
+  }
+
+
+  bool D3D9DeviceEx::SodReliefTextures() {
+    // identity texture (R, G = texel centre / 256, sampled mirrored + bilinear: the draw's own UVs without a wrap
+    // seam) and the 2x2 half-period texture (B = 64 * (u half + 2 * v half), sampled at uv / 2, wrapped)
+    if (!m_sodRelIdent) {
+      IDirect3DTexture9* tex = nullptr;
+      m_sodNoUpscale = true;
+      const HRESULT hrT = CreateTexture(256, 256, 1, 0, D3DFMT_A16B16G16R16, D3DPOOL_MANAGED, &tex, nullptr);
+      m_sodNoUpscale = false;
+      if (FAILED(hrT) || !tex) return false;
+      D3DLOCKED_RECT lr = { };
+      if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) { tex->Release(); return false; }
+      for (UINT y = 0; y < 256; y++) {
+        uint16_t* row = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch);
+        for (UINT x = 0; x < 256; x++) {
+          row[x * 4 + 0] = uint16_t((float(x) + 0.5f) / 256.0f * 65535.0f + 0.5f);
+          row[x * 4 + 1] = uint16_t((float(y) + 0.5f) / 256.0f * 65535.0f + 0.5f);
+          row[x * 4 + 2] = 0; row[x * 4 + 3] = 0;
+        }
+      }
+      tex->UnlockRect(0);
+      static_cast<D3D9Texture2D*>(tex)->AddRefPrivate();
+      tex->Release();
+      m_sodRelIdent = tex;
+    }
+    if (!m_sodRelBits) {
+      IDirect3DTexture9* tex = nullptr;
+      m_sodNoUpscale = true;
+      const HRESULT hrT = CreateTexture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
+      m_sodNoUpscale = false;
+      if (FAILED(hrT) || !tex) return false;
+      D3DLOCKED_RECT lr = { };
+      if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) { tex->Release(); return false; }
+      for (UINT y = 0; y < 2; y++) {
+        uint32_t* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch);
+        for (UINT x = 0; x < 2; x++) row[x] = (x + 2u * y) * 64u;            // blue channel
+      }
+      tex->UnlockRect(0);
+      static_cast<D3D9Texture2D*>(tex)->AddRefPrivate();
+      tex->Release();
+      m_sodRelBits = tex;
+    }
+    return true;
+  }
+
+
+  void D3D9DeviceEx::SodReliefGenerate() {
+    // height / normal maps for the textures drawn this frame that don't have them yet (at most kGenSlots per frame;
+    // queued before this frame's relief pass in the command stream, so they are used right away)
+    const auto& entries = m_sodRelTable->Entries();
+    std::vector<sod::ReliefGenJob> jobs;
+    bool full = false;
+    for (const auto& d : m_sodRelDraws) {
+      if (jobs.size() >= sod::ReliefPass::kGenSlots || full) break;
+      const auto& ei = m_sodRelEntryItems[d.entry];
+      void* t9 = m_sodRelTex9Of[d.entry];
+      if (!t9) continue;
+      for (uint32_t k = ei.first; k < ei.first + ei.second && jobs.size() < sod::ReliefPass::kGenSlots; k++) {
+        SodRelItem& it = m_sodRelItems[k];
+        if (it.ready || it.failed) continue;
+        D3D9CommonTexture* ct = static_cast<D3D9Texture2D*>(static_cast<IDirect3DTexture9*>(t9))->GetCommonTexture();
+        if (!ct || ct->GetImage() == nullptr) continue;
+        Rc<DxvkImage> img = ct->GetImage();
+        const VkExtent3D ext = img->info().extent;
+        const uint32_t code = sod::ReliefPass::FormatCode(img->info().format);
+        if (code == ~0u || img->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+          it.failed = true;
+          Logger::warn(str::format("SoD-RT: surface depth: entry ", entries[d.entry].index, " format ", img->info().format, " not supported"));
+          continue;
+        }
+        uint32_t rx = 0, ry = 0, rw = ext.width, rh = ext.height;
+        if (entries[d.entry].page) {
+          const float sx = float(ext.width) / float(std::max<uint16_t>(entries[d.entry].pw, 1));
+          const float sy = float(ext.height) / float(std::max<uint16_t>(entries[d.entry].ph, 1));
+          rx = uint32_t(float(it.rx) * sx + 0.5f); ry = uint32_t(float(it.ry) * sy + 0.5f);
+          rw = uint32_t(float(it.rw) * sx + 0.5f); rh = uint32_t(float(it.rh) * sy + 0.5f);
+          if (rx >= ext.width || ry >= ext.height) { it.failed = true; continue; }
+          rw = std::min(rw, ext.width - rx); rh = std::min(rh, ext.height - ry);
+        }
+        // relief maps at up to 4x the texture (the ground textures are often 32x32), at most 256x256
+        const uint32_t sc = std::max(1u, std::min(4u, 256u / std::max(rw, rh)));
+        if (rw < 4 || rh < 4 || rw * rh * sc * sc > sod::ReliefPass::kMaxItemTexels) { it.failed = true; continue; }
+        if (m_sodRelAtlasNext + rw * rh > sod::ReliefPass::kAtlasTexels
+         || m_sodRelReliefNext + rw * rh * sc * sc > sod::ReliefPass::kReliefTexels) {
+          if (!jobs.empty()) { full = true; break; }            // start over next frame
+          m_sodRelAtlasNext = 0; m_sodRelReliefNext = 0;
+          for (auto& o : m_sodRelItems) o.ready = false;
+          Logger::info("SoD-RT: surface depth: atlas full, starting over");
+        }
+        it.atlas = m_sodRelAtlasNext; m_sodRelAtlasNext += rw * rh;
+        it.reliefAtlas = m_sodRelReliefNext; m_sodRelReliefNext += rw * rh * sc * sc; it.scale = sc;
+        it.w = rw; it.h = rh; it.texW = ext.width; it.texH = ext.height; it.tex9 = t9;
+        sod::ReliefGenJob j;
+        j.image = img; j.offset = VkOffset3D { int32_t(rx), int32_t(ry), 0 }; j.extent = VkExtent3D { rw, rh, 1u };
+        j.format = code; j.atlasOffset = it.atlas; j.reliefOffset = it.reliefAtlas; j.scale = sc; j.cls = it.cls;
+        jobs.push_back(j);
+        it.ready = true;
+        Logger::info(str::format("SoD-RT: surface depth: generated maps for texture ", entries[d.entry].index,
+          entries[d.entry].page ? " (page region " : " (", rw, "x", rh, " at ", sc, "x, class ", uint32_t(it.cls), ")"));
+      }
+    }
+    m_sodRel->Generate(this, jobs);
+  }
+
+
+  void D3D9DeviceEx::SodReliefApply() {
+    if (m_sodRelDraws.empty() || !m_sodRelTable) return;
+    D3D9Surface* ds = m_state.depthStencil.ptr();
+    D3D9Surface* rt = m_state.renderTargets[0].ptr();
+    if (!ds || !rt) return;
+    const VkExtent2D ext = ds->GetSurfaceExtent(), rext = rt->GetSurfaceExtent();
+    if (ext.width != rext.width || ext.height != rext.height) return;
+    D3D9CommonTexture* dtex = ds->GetCommonTexture();
+    D3D9CommonTexture* ctex = rt->GetCommonTexture();
+    if (!dtex || !ctex || dtex->GetImage() == nullptr || ctex->GetImage() == nullptr) return;
+    if (dtex->GetImage()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT || ctex->GetImage()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) return;
+    if (!m_sodRel) {
+      try { m_sodRel = std::make_unique<sod::ReliefPass>(m_dxvkDevice); }
+      catch (const DxvkError& e) { Logger::err(str::format("SoD-RT: surface depth unavailable: ", e.message())); m_sodRelFailed = true; return; }
+    }
+    if (!SodReliefTextures()) { Logger::err("SoD-RT: surface depth unavailable (helper textures)"); m_sodRelFailed = true; return; }
+    if (!m_sodRelUvRT || m_sodRelUvW != ext.width || m_sodRelUvH != ext.height) {
+      if (m_sodRelUvRT) static_cast<D3D9Texture2D*>(m_sodRelUvRT)->ReleasePrivate();
+      m_sodRelUvRT = nullptr; m_sodRelUvW = m_sodRelUvH = 0;
+      IDirect3DTexture9* tex = nullptr;
+      if (FAILED(CreateTexture(ext.width, ext.height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16, D3DPOOL_DEFAULT, &tex, nullptr)) || !tex) {
+        Logger::err("SoD-RT: surface depth unavailable (no A16B16G16R16 render target)"); m_sodRelFailed = true; return;
+      }
+      static_cast<D3D9Texture2D*>(tex)->AddRefPrivate();
+      tex->Release();
+      m_sodRelUvRT = tex; m_sodRelUvW = ext.width; m_sodRelUvH = ext.height;
+    }
+
+    // 1. maps for textures seen for the first time
+    SodReliefGenerate();
+
+    // 2. replay the recorded ground draws into the UV / id target, depth-tested against the finished opaque scene
+    IDirect3DSurface9* uvSurf = nullptr;
+    if (FAILED(m_sodRelUvRT->GetSurfaceLevel(0, &uvSurf)) || !uvSurf) return;
+    IDirect3DStateBlock9* sb = nullptr;
+    if (FAILED(CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) { uvSurf->Release(); return; }
+    m_sodInternal = true;
+    Com<IDirect3DSurface9> savedRt = m_state.renderTargets[0].ptr();
+    SetRenderTarget(0, uvSurf);
+    Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+    SetVertexShader(nullptr); SetPixelShader(nullptr);
+    SetTexture(0, m_sodRelIdent);
+    SetTexture(1, m_sodRelBits);
+    for (DWORD i = 2; i < 8; i++) SetTexture(i, nullptr);
+    SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1); SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1); SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
+    SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+    SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_ADD);
+    SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT); SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+    SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1); SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+    SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0);
+    SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+    SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_DISABLE); SetTextureStageState(2, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    { D3DMATRIX half = { }; half._11 = 0.5f; half._22 = 0.5f; half._33 = 1.0f; half._44 = 1.0f; SetTransform(D3DTS_TEXTURE1, &half); }
+    SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR); SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_MIRROR); SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_MIRROR);
+    SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE); SetSamplerState(0, D3DSAMP_MAXANISOTROPY, 1);
+    SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT); SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP); SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    SetSamplerState(1, D3DSAMP_SRGBTEXTURE, FALSE);
+    const std::pair<D3DRENDERSTATETYPE, DWORD> rs[] = {
+      { D3DRS_ZENABLE, D3DZB_TRUE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE },
+      { D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_FOGENABLE, FALSE }, { D3DRS_LIGHTING, FALSE }, { D3DRS_SPECULARENABLE, FALSE },
+      { D3DRS_COLORWRITEENABLE, 0xF }, { D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_SRGBWRITEENABLE, FALSE },
+      { D3DRS_FILLMODE, D3DFILL_SOLID }, { D3DRS_STENCILENABLE, FALSE }, { D3DRS_TWOSIDEDSTENCILMODE, FALSE },
+      { D3DRS_CLIPPLANEENABLE, 0 }, { D3DRS_VERTEXBLEND, D3DVBF_DISABLE }, { D3DRS_INDEXEDVERTEXBLENDENABLE, FALSE },
+    };
+    for (const auto& kv : rs) SetRenderState(kv.first, kv.second);
+    uint32_t drawn = 0;
+    for (const auto& d : m_sodRelDraws) {
+      bool any = false;
+      const auto& ei = m_sodRelEntryItems[d.entry];
+      for (uint32_t k = ei.first; k < ei.first + ei.second; k++) any |= m_sodRelItems[k].ready;
+      if (!any) continue;
+      SetRenderState(D3DRS_TEXTUREFACTOR, uint32_t(d.entry + 1) << 24);
+      DWORD zf = d.zfunc;
+      if (zf == D3DCMP_GREATER) zf = D3DCMP_GREATEREQUAL;
+      else if (zf == D3DCMP_LESS) zf = D3DCMP_LESSEQUAL;
+      SetRenderState(D3DRS_ZFUNC, zf);
+      SetRenderState(D3DRS_CULLMODE, d.cull);
+      SetRenderState(D3DRS_DEPTHBIAS, d.depthBias);
+      SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, d.slopeBias);
+      SetViewport(&d.vp);
+      SetTransform(D3DTS_WORLD, &d.world); SetTransform(D3DTS_VIEW, &d.view); SetTransform(D3DTS_PROJECTION, &d.proj);
+      SetFVF(d.fvf);
+      SetStreamSource(0, d.vb.ptr(), d.vbOffset, d.stride);
+      SetIndices(d.ib.ptr());
+      DrawIndexedPrimitive(d.type, d.base, d.minIndex, d.numVertices, d.startIndex, d.primCount);
+      drawn++;
+    }
+    SetRenderTarget(0, savedRt.ptr());
+    sb->Apply();
+    sb->Release();
+    m_sodInternal = false;
+    uvSurf->Release();
+    if (!drawn) return;
+
+    // 3. item table, 4. march, 5. blend over the frame
+    std::vector<uint32_t> table(512u + 8u * m_sodRelItems.size(), 0u);
+    for (size_t e = 0; e < m_sodRelEntryItems.size() && e < 256; e++) {
+      table[e * 2] = m_sodRelEntryItems[e].first; table[e * 2 + 1] = m_sodRelEntryItems[e].second;
+    }
+    const auto& entries = m_sodRelTable->Entries();
+    for (size_t k = 0; k < m_sodRelItems.size(); k++) {
+      const SodRelItem& it = m_sodRelItems[k];
+      uint32_t* w = &table[512u + 8u * k];
+      if (!it.ready) continue;
+      const bool page = entries[it.entry].page;
+      const float sx = page ? float(it.texW) / float(std::max<uint16_t>(entries[it.entry].pw, 1)) : 1.0f;
+      const float sy = page ? float(it.texH) / float(std::max<uint16_t>(entries[it.entry].ph, 1)) : 1.0f;
+      const uint32_t rx = page ? uint32_t(float(it.rx) * sx + 0.5f) : 0u, ry = page ? uint32_t(float(it.ry) * sy + 0.5f) : 0u;
+      w[0] = it.atlas; w[1] = it.w | (it.h << 16); w[2] = rx | (ry << 16); w[3] = it.texW | (it.texH << 16);
+      w[4] = uint32_t(it.cls) | (1u << 8);
+      w[5] = it.reliefAtlas; w[6] = it.scale;
+    }
+    if (table.size() > sod::ReliefPass::kTableWords) table.resize(sod::ReliefPass::kTableWords);
+
+    static const int envDebug = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_RELIEF_DEBUG", v, 8) ? std::atoi(v) : 0; }();
+    static const float envDepth = [] { char v[16] = { }; return ::GetEnvironmentVariableA("SODRT_RELIEF_DEPTH", v, 16) ? float(std::atof(v)) : 1.0f; }();
+    const int level = m_sodRt.SurfaceDepth();
+    sod::ReliefParams p = { };
+    for (int i = 0; i < 4; i++) p.proj[i] = m_sodAoProj[i];
+    p.viewport[0] = float(m_sodAoVp.X); p.viewport[1] = float(m_sodAoVp.Y);
+    p.viewport[2] = float(m_sodAoVp.Width); p.viewport[3] = float(m_sodAoVp.Height);
+    // light for the normal-map shading: from above, a little from the side (world y is up), into view space
+    {
+      const D3DMATRIX& V = m_sodRelDraws.front().view;
+      float L[3] = { -0.35f, 1.0f, -0.3f };
+      float v[3];
+      for (int c = 0; c < 3; c++) v[c] = L[0] * V.m[0][c] + L[1] * V.m[1][c] + L[2] * V.m[2][c];
+      float n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+      if (n < 1e-6f) { v[0] = 0.0f; v[1] = 1.0f; v[2] = 0.0f; n = 1.0f; }
+      p.light[0] = v[0] / n; p.light[1] = v[1] / n; p.light[2] = v[2] / n; p.light[3] = 0.45f;
+      // world up (y) in view space: the relief is for ground only, walls sharing a listed texture are skipped
+      float u[3] = { V.m[1][0], V.m[1][1], V.m[1][2] };
+      float un = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+      if (un > 1e-6f) { p.up[0] = u[0] / un; p.up[1] = u[1] / un; p.up[2] = u[2] / un; }
+      p.up[3] = 3.0f;                                     // edge feather: 3 texels
+    }
+    p.fog[0] = m_sodAoFog[0]; p.fog[1] = m_sodAoFog[1]; p.fog[2] = m_sodAoFog[2]; p.fog[3] = float(envDebug);
+    p.depth[0] = 0.035f * envDepth; p.depth[1] = 0.02f * envDepth; p.depth[2] = 0.025f * envDepth; p.depth[3] = 0.07f;
+    p.steps = level >= 2 ? 24u : 12u;
+    p.flags = level >= 2 ? 1u : 0u;
+    D3D9CommonTexture* utex = static_cast<D3D9Texture2D*>(m_sodRelUvRT)->GetCommonTexture();
+    if (!utex || utex->GetImage() == nullptr) return;
+    if (!m_sodRel->Record(this, dtex->GetImage(), ctex->GetImage(), utex->GetImage(), ext.width, ext.height, p, table)) return;
+    if ((m_sodRelFrames++ % 600u) == 0u)
+      Logger::info(str::format("SoD-RT: surface depth ", level >= 2 ? "HIGH" : "LOW", " ", ext.width, "x", ext.height,
+        " ground draws ", drawn, " mapped textures ", m_sodRelMap.size(), " atlas ", m_sodRelAtlasNext, " texels"));
+    SodMultiplyPass(m_sodRel->Result(), ext.width, ext.height, false, &m_sodRelOutTex, &m_sodRelOutW, &m_sodRelOutH, true);
   }
 
 

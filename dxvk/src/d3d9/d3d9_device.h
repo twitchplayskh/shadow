@@ -9,6 +9,10 @@
 #include "d3d9_sod_link.h"
 #include "d3d9_sod_ao.h"
 #include "d3d9_sod_ssr.h"
+#include "d3d9_sod_relief.h"
+#include "d3d9_sod_upscale.h"
+#include "d3d9_sod_sr.h"
+#include <deque>
 #include "d3d9_cursor.h"
 #include "d3d9_format.h"
 #include "d3d9_adapter.h"
@@ -234,10 +238,15 @@ namespace dxvk {
     friend class sod::BridgeLink;
     friend class sod::AoPass;
     friend class sod::SsrPass;
+    friend class sod::ReliefPass;
+    friend class sod::UpscalePass;
+    friend class sod::SrPass;
 
     using CbvIndex = D3D9ShaderResourceMapping::CbvIndex;
   public:
     void SodMarkWork() { m_sodRt.MarkWork(); }
+    bool SodNoUpscale() const { return m_sodNoUpscale; }     // our own helper textures keep their size
+    int  SodUpscaleLevel() const { return m_sodRt.TextureUpscaling(); }   // TEXTURE UPSCALING: 0 off, 1 2X, 2 3X, 3 4X
     struct SodFrameLog { uint32_t left = 0, draws = 0, scene = 0, rhwDraws = 0, untextured = 0, clears = 0, rtSets = 0,
                          copies = 0, vpChanges = 0; DWORD clearFlags = 0; D3DCOLOR clearColor = 0; D3DVIEWPORT9 vp = { }; };
     SodFrameLog m_sodLog;
@@ -981,6 +990,162 @@ namespace dxvk {
     void SodSsrRecord(D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount);
     void SodSsrApply();
     IDirect3DTexture9* SodSsrPageMask(int entry);
+    // surface depth: parallax relief on the ground textures of SoDFix\relief.txt (d3d9_sod_relief.h)
+    struct SodRelItem {
+      int entry = -1; uint16_t rx = 0, ry = 0, rw = 0, rh = 0; uint8_t cls = 0;   // region in relief.txt page units
+      uint32_t atlas = 0, reliefAtlas = 0, scale = 1, w = 0, h = 0, texW = 0, texH = 0;   // as generated
+      void* tex9 = nullptr;                                                        // texture it was generated from
+      bool ready = false, failed = false;
+    };
+    std::unique_ptr<sod::ReliefPass>  m_sodRel;
+    std::unique_ptr<sod::ReliefTable> m_sodRelTable;
+    bool m_sodRelTried = false, m_sodRelFailed = false;
+    std::vector<void*> m_sodRelTex8, m_sodRelTex9Of;
+    std::unordered_map<IDirect3DBaseTexture9*, int> m_sodRelMap;
+    std::vector<SodRelItem> m_sodRelItems;
+    std::vector<std::pair<uint32_t, uint32_t>> m_sodRelEntryItems;   // per entry: first item, count
+    uint32_t m_sodRelAtlasNext = 0, m_sodRelReliefNext = 0;
+    std::vector<SodSsrDraw> m_sodRelDraws;
+    IDirect3DTexture9* m_sodRelUvRT = nullptr;     // PRIVATE references
+    IDirect3DTexture9* m_sodRelIdent = nullptr;
+    IDirect3DTexture9* m_sodRelBits = nullptr;
+    IDirect3DTexture9* m_sodRelOutTex = nullptr;
+    UINT m_sodRelUvW = 0, m_sodRelUvH = 0, m_sodRelOutW = 0, m_sodRelOutH = 0;
+    uint32_t m_sodRelFrames = 0;
+    void SodReliefFrame();
+    void SodReliefRecord(D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount);
+    void SodReliefGenerate();
+    void SodReliefApply();
+    bool SodReliefTextures();
+    // texture upscaling on upload (d3d9_sod_upscale.h)
+    std::unique_ptr<sod::UpscalePass> m_sodUp;
+    bool m_sodUpFailed = false, m_sodNoUpscale = false;
+    uint32_t m_sodUpCount = 0;
+    bool SodUpscaleUpload(D3D9CommonTexture* pResource, UINT Subresource);
+    // texture super-resolution in the background (d3d9_sod_sr.h)
+    struct SodSrJob {
+      std::weak_ptr<D3D9CommonTexture::SodSrToken> token; uint32_t gen = 0;
+      D3D9CommonTexture* tex = nullptr; Rc<DxvkImage> image;
+      std::vector<uint8_t> texels; uint32_t w = 0, h = 0, scale = 1, format = 0; bool opaque = false;
+      int layer = -1;                                  // next layer; -1 = not started
+      uint64_t key = 0; VkDeviceSize outBytes = 0;     // disk cache
+    };
+    struct SodSrReadback { Rc<DxvkBuffer> buffer; VkDeviceSize bytes; uint64_t key, seq; };
+    std::vector<SodSrReadback> m_sodSrReadbacks;
+    std::unique_ptr<sod::TexCache> m_sodCache;
+    uint32_t m_sodCacheHits = 0;
+    std::vector<int> m_sodTextIds;
+    std::unordered_set<int> m_sodTextLogged;
+    bool m_sodTextTried = false;
+    bool SodIsTextTexture(D3D9CommonTexture* pResource);
+    // IMPROVED GEOMETRY (d3d9_sod_geom.cpp): street textures laid out seamlessly in world space at draw time
+    struct SodGeomEntry { int index = 0; bool page = false; uint16_t pw = 0, ph = 0, x = 0, y = 0, w = 0, h = 0; float tile = 0.0f;
+                          bool wall = false; float tileW = 0.0f, tileH = 0.0f, vsign = 1.0f; };   // wall: aligned layout per face
+    std::vector<SodGeomEntry> m_sodGeomEntries;
+    std::vector<void*> m_sodGeomTex8, m_sodGeomTex9Of;
+    std::vector<IDirect3DTexture9*> m_sodGeomTile;             // per entry: the repeating tile (PRIVATE reference)
+    std::unordered_map<IDirect3DBaseTexture9*, std::vector<int>> m_sodGeomMap;   // a page can hold several street tiles
+    // per street draw: its triangles sorted into groups (game mapping / seamless per tile entry), as index lists in
+    // an index buffer of our own. Built once; rebuilt only when the game rewrites the vertex or index data.
+    struct SodGeomGroup { int entry = -1; UINT start = 0, tris = 0; int wallDeg = -1;
+                          float tileW = 0.0f, tileH = 0.0f, vsign = 1.0f; bool turned = false; };   // wall: measured in this draw
+    struct SodGeomMeas { float tw, th, vs, area; bool turned, ok; };
+    std::vector<SodGeomMeas> m_sodGeomTriMeas;
+    std::unordered_map<IDirect3DBaseTexture9*, int> m_sodGeomIdxOf;
+    std::unordered_set<uint64_t> m_sodGeomSurveyed;
+    std::vector<IDirect3DTexture9*> m_sodGeomTiles;
+    int  SodGeomTableIndex(IDirect3DBaseTexture9* tex);
+    void SodGeomSurvey(const char* api, D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount, bool indexed);
+    struct SodGeomCached {
+      uint64_t vbUid = 0, ibUid = 0; uint32_t vbGen = 0, ibGen = 0;
+      INT base = 0; UINT minIndex = 0, numVertices = 0, startIndex = 0, primCount = 0, type = 0;
+      IDirect3DBaseTexture9* tex = nullptr; float rot[9] = { };
+      IDirect3DIndexBuffer9* ib = nullptr;           // PRIVATE reference
+      std::vector<SodGeomGroup> groups;              // empty: draw as the game does
+      uint32_t lastFrame = 0;
+    };
+    std::unordered_map<uint64_t, SodGeomCached> m_sodGeomCache;
+    uint32_t m_sodGeomFrameNo = 0, m_sodGeomBuilds = 0;
+    D3DMATRIX m_sodGeomView = { }, m_sodGeomInvView = { };
+    void SodGeomDropCache();
+    bool SodGeomBuild(SodGeomCached& c, const std::vector<int>& entries);
+    HRESULT SodDrawIndexedRaw(D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount);
+    IDirect3DTexture9* m_sodGeomMask = nullptr;                // PRIVATE reference
+    bool m_sodGeomTried = false, m_sodGeomFailed = false, m_sodGeomWarned = false;
+    uint32_t m_sodGeomDraws = 0;
+    void SodGeomFrame();
+    // camera / frame pacing trace (d3d9_sod_camtrace.cpp)
+    void* m_sodCamFile = nullptr;
+    float m_sodCamView[16] = { }, m_sodCamChar[3] = { };
+    bool m_sodCamHaveView = false, m_sodCamHaveChar = false, m_sodCamKey = false;
+    uint32_t m_sodCamCount = 0, m_sodCamPoll = 0, m_sodCamDraws = 0;
+    int64_t m_sodCamT0 = 0; double m_sodCamLast = 0.0;
+    void SodCamObserve();
+    // SMOOTH CAMERA (d3d9_sod_smoothcam.cpp)
+    static constexpr uint32_t kSodScHist = 15;
+    D3DMATRIX m_sodScRaw = { }, m_sodScView = { };
+    bool m_sodScFrameSet = false, m_sodScActive = false, m_sodScValid = false;
+    float m_sodScPos[3] = { }, m_sodScLastRaw[3] = { }, m_sodScFwd[3] = { }, m_sodScVel[3] = { };
+    float m_sodScHist[kSodScHist][3] = { };
+    uint32_t m_sodScHistN = 0, m_sodScHistI = 0;
+    bool SodSmoothCamEnabled() const;
+    void SodSmoothCamBegin(const D3DMATRIX& raw);
+    const D3DMATRIX* SodSmoothCamView(const D3DMATRIX* m);
+    bool SodSmoothCamConstants(const float* in, float* out);
+    std::vector<float> m_sodScConst;
+    void SodCamFrame();
+    std::unordered_set<uint64_t> m_sodGeomSkipLogged;
+    std::vector<uint32_t> m_sodGeomTriEntry, m_sodGeomIdx;
+    bool SodGeomDraw(D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount);
+    void SodGeomSkip(int entry, uint32_t reason, const char* text);
+    IDirect3DTexture9* SodGeomTile(int entry);
+    bool SodGeomMakeMask();
+    struct SodGeomGuard {
+      D3D9DeviceEx* dev = nullptr;
+      IDirect3DBaseTexture9* tex[5] = { };
+      DWORD tss[6][11] = { };
+      DWORD ss[4][7] = { };
+      D3DMATRIX tm[4] = { };
+      bool internal = false;
+      DWORD tfactor = 0;
+      bool Begin(D3D9DeviceEx* d, int entry, IDirect3DTexture9* tile, const SodGeomGroup* wall = nullptr);
+      ~SodGeomGuard();
+    };
+    // CRISP TEXT: the game's text images (subtitle font, clock digits, place names) redrawn as clean white lettering
+    struct SodCrispTex { Com<IDirect3DTexture9> hi; uint64_t hash = 0; uint64_t checked = 0; uint64_t used = 0; size_t bytes = 0; int id = 0; int mode = 0; };
+    std::vector<int> m_sodCrispList;
+    std::unordered_map<IDirect3DBaseTexture9*, SodCrispTex> m_sodCrisp;
+    std::vector<std::pair<int, IDirect3DBaseTexture9*>> m_sodCrispIds;
+    uint64_t m_sodCrispFrame = ~0ull;
+    bool m_sodCrispTried = false;
+    std::unordered_set<int> m_sodCrispLogged;
+    IDirect3DTexture9* SodCrispFor(IDirect3DBaseTexture9* tex);
+    bool SodCrispBuild(IDirect3DTexture9* src, SodCrispTex& c);
+    // subtitle backing: a faint soft dark band behind subtitle lines (text from the subtitle font low on the screen),
+    // placed where the subtitle text was in the frame before
+    struct SodBand { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, alpha = 0.0f; bool any = false; };
+    SodBand m_sodBandCur, m_sodBandPrev;
+    uint64_t m_sodBandFrame = ~0ull, m_sodBandDrawn = ~0ull;
+    int m_sodCrispLastId = 0;
+    Com<IDirect3DTexture9> m_sodBandTex;
+    Com<IDirect3DStateBlock9> m_sodBandSb;
+    void SodBandObserve(const uint8_t* v, UINT stride, UINT count);
+    void SodBandDraw();
+    struct SodCrispScope {
+      D3D9DeviceEx* dev = nullptr;
+      int id = 0;
+      IDirect3DBaseTexture9* tex = nullptr;
+      DWORD ss[5] = { };
+      explicit SodCrispScope(D3D9DeviceEx* d);
+      ~SodCrispScope();
+    };
+    std::unique_ptr<sod::SrPass> m_sodSr;
+    bool m_sodSrTried = false;
+    std::deque<SodSrJob> m_sodSrQueue;
+    uint32_t m_sodSrDone = 0;
+    void SodSrEnqueue(D3D9CommonTexture* pResource, const void* texels, VkDeviceSize bytes, uint32_t format, bool opaque,
+                      uint64_t key, VkDeviceSize outBytes);
+    void SodSrFrame();
     // ambient occlusion (GTAO): after the opaque 3D scene, before see-through effects and 2D
     std::unique_ptr<sod::AoPass> m_sodAo;
     bool  m_sodAoSeen3D = false, m_sodAoDone = false, m_sodAoFailed = false;

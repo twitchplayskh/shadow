@@ -58,6 +58,34 @@ namespace dxvk::sod {
     return m_getSsr ? m_getSsr() : 0;
   }
 
+  int RtCapture::SurfaceDepth() const {
+    static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_RELIEF", v, 8) ? std::atoi(v) : -1; }();
+    if (env >= 0) return std::min(env, 2);
+    return 0;                                  // 0.16: off (no menu row) until it looks right; SODRT_RELIEF=1/2 to test
+  }
+
+  int RtCapture::TextureUpscaling() const {
+    static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_UPSCALE", v, 8) ? std::atoi(v) : -1; }();
+    if (env == 0) return 0;
+    if (env >= 2 && env <= 4) return env - 1;
+    if (!m_getUp && !m_getRtLevel) {                 // looked up once SoDFix is known (OnInit), else 4X
+      return 3;
+    }
+    return m_getUp ? std::min(std::max(m_getUp(), 0), 3) : 3;
+  }
+
+  int RtCapture::ImprovedGeometry() const {
+    static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_GEOM", v, 8) ? std::atoi(v) : -1; }();
+    if (env >= 0) return env ? 1 : 0;
+    return m_getGeom ? (m_getGeom() ? 1 : 0) : 0;
+  }
+
+  int RtCapture::SmoothCamera() const {
+    static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_SMOOTHCAM", v, 8) ? std::atoi(v) : -1; }();
+    if (env >= 0) return env ? 1 : 0;
+    return m_getSmoothCam ? (m_getSmoothCam() ? 1 : 0) : 1;                // on unless SoDFix says otherwise
+  }
+
   void RtCapture::OnInit(VkPhysicalDevice adapter, const Rc<vk::InstanceFn>& vki) {
     // SoDFix (dinput8 proxy) exports the menu's RAY TRACING level
     if (HMODULE m = ::GetModuleHandleA("dinput8.dll"))
@@ -67,7 +95,11 @@ namespace dxvk::sod {
       m_getTf = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetTextureFiltering"));
       m_getBars = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetCinematicBars"));
       m_getAo = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetAmbientOcclusion"));
-      m_getSsr = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetReflections")); }
+      m_getSsr = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetReflections"));
+      m_getRelief = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetSurfaceDepth"));
+      m_getUp = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetTextureUpscaling"));
+      m_getGeom = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetImprovedGeometry"));
+      m_getSmoothCam = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetSmoothCamera")); }
     Logger::info(str::format("SoD-RT: capture layer active (milestone 1: capture/validation only), SoDFix link ",
       m_getRtLevel ? "found" : "not found"));
 

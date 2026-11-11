@@ -303,6 +303,13 @@ namespace dxvk {
     }
 
     /**
+     * \brief SoD texture upscaling factor (1 = image has the texture's own size)
+     */
+    uint32_t SodScale() const {
+      return m_sodScale;
+    }
+
+    /**
      * \brief Checks whether sRGB views can be created
      * \returns Whether the format is sRGB compatible.
      */
@@ -523,6 +530,16 @@ namespace dxvk {
     bool                          m_shadow; //< Depth Compare-ness
     bool                          m_upgradedToD32f; // Dref Clamp
     bool                          m_supportsFetch4;
+
+    // SoD: the Vulkan image is this many times bigger than the texture the game sees (upscaled on upload)
+    uint32_t                      m_sodScale = 1u;
+  public:
+    // SoD: upload generation (super-resolution jobs for older uploads are dropped) and count; expires with the texture
+    struct SodSrToken { uint32_t gen = 0u, uploads = 0u; };
+    const std::shared_ptr<SodSrToken>& SodToken() { if (!m_sodToken) m_sodToken = std::make_shared<SodSrToken>(); return m_sodToken; }
+  private:
+    std::shared_ptr<SodSrToken>   m_sodToken;
+    uint32_t                      DetermineSodScale(D3DRESOURCETYPE ResourceType) const;
 
     int64_t                       m_size = 0;
 

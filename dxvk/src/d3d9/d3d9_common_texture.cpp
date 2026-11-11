@@ -2,6 +2,7 @@
 
 #include "d3d9_util.h"
 #include "d3d9_device.h"
+#include "d3d9_sod_upscale.h"
 
 #include "../util/util_shared_res.h"
 #include "../util/util_win32_compat.h"
@@ -44,6 +45,7 @@ namespace dxvk {
     m_supportsFetch4 = DetermineFetch4Compatibility();
 
     if (TextureUsesImage(&m_desc)) {
+      m_sodScale = DetermineSodScale(ResourceType);
       m_image = CreatePrimaryImage(ResourceType, pSharedHandle);
 
       if (unlikely(m_image == nullptr && (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP))) {
@@ -383,6 +385,29 @@ namespace dxvk {
   }
 
 
+  uint32_t D3D9CommonTexture::DetermineSodScale(D3DRESOURCETYPE ResourceType) const {
+    // SoD: the game's own textures (managed, one level or automatic mips, plain colour formats, up to 512) are
+    // uploaded to the GPU at 4x (up to 128) or 2x (up to 512) through the edge-directed upscaler
+    // (d3d9_sod_upscale.h). The game keeps seeing, locking and copying the original size.
+    // TEXTURE UPSCALING (menu): 4X = 4x up to 128, 2x up to 512; 3X = 3x up to 128, 2x up to 512; 2X = 2x; OFF
+    const int level = m_device->SodUpscaleLevel();
+    if (level <= 0 || ResourceType != D3DRTYPE_TEXTURE || !IsPoolManaged(m_desc.Pool) || m_device->SodNoUpscale()) return 1u;
+    if (m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_DYNAMIC)) return 1u;
+    if (m_desc.ArraySize != 1 || m_desc.Depth != 1 || m_desc.MultiSample != D3DMULTISAMPLE_NONE) return 1u;
+    if (m_desc.MipLevels != 1 && !(m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP)) return 1u;
+    if (m_mapping.ConversionFormatInfo.FormatType != D3D9ConversionFormat_None) return 1u;
+    if (sod::UpscalePass::FormatCode(m_mapping.Format) == ~0u) return 1u;
+    const uint32_t m = std::max(m_desc.Width, m_desc.Height);
+    if (std::min(m_desc.Width, m_desc.Height) < 4 || m > 512) return 1u;
+    uint32_t s = 2u;
+    if (m <= 128 && level >= 3) s = 4u;
+    else if (m <= 128 && level == 2) s = 3u;
+    // 16-bit formats are packed two texels per word: the enlarged width must be even
+    if ((m_desc.Width * s) & 1u) s = 2u;
+    return s;
+  }
+
+
   Rc<DxvkImage> D3D9CommonTexture::CreatePrimaryImage(D3DRESOURCETYPE ResourceType, HANDLE* pSharedHandle) const {
     DxvkImageCreateInfo imageInfo;
     imageInfo.type            = GetImageTypeFromResourceType(ResourceType);
@@ -391,8 +416,8 @@ namespace dxvk {
                               : m_mapping.Format;
     imageInfo.flags           = 0;
     imageInfo.sampleCount     = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.extent.width    = m_desc.Width;
-    imageInfo.extent.height   = m_desc.Height;
+    imageInfo.extent.width    = m_desc.Width * m_sodScale;
+    imageInfo.extent.height   = m_desc.Height * m_sodScale;
     imageInfo.extent.depth    = m_desc.Depth;
     imageInfo.numLayers       = m_desc.ArraySize;
     imageInfo.mipLevels       = m_desc.MipLevels;

@@ -88,6 +88,10 @@ namespace dxvk {
       int  CinematicBars() const { return m_getBars ? m_getBars() : 1; }   // 1 on (game default), 0 off
       int  AmbientOcclusion() const;                                         // 0 off, 1 low, 2 high (SODRT_AO overrides)
       int  Reflections() const;                                              // 0 off, 1 low, 2 high (SODRT_SSR overrides)
+      int  SurfaceDepth() const;                                             // 0 off, 1 low, 2 high (SODRT_RELIEF overrides)
+      int  TextureUpscaling() const;                                         // 0 off, 1 2X, 2 3X, 3 4X (SODRT_UPSCALE=0/2/3/4)
+      int  ImprovedGeometry() const;
+      int  SmoothCamera() const;                                             // 0 off, 1 on (SODRT_SMOOTHCAM overrides)                                         // 0 off, 1 on (SODRT_GEOM overrides)
       uint64_t Frame() const { return m_frame; }
       bool InPass()  const { return m_inPass; }
 
@@ -126,6 +130,10 @@ namespace dxvk {
       int                  (*m_getBars)() = nullptr;
       int                  (*m_getAo)() = nullptr;
       int                  (*m_getSsr)() = nullptr;
+      int                  (*m_getRelief)() = nullptr;
+      int                  (*m_getUp)() = nullptr;
+      int                  (*m_getGeom)() = nullptr;
+      int                  (*m_getSmoothCam)() = nullptr;
 
       // 64-bit hardware RT bridge (sod_rt64.exe)
       void*                  m_bridgeMap    = nullptr;   // HANDLE

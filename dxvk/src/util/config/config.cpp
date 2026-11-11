@@ -566,7 +566,7 @@ namespace dxvk {
      * The ray-traced shadows read the CPU-skinned character meshes and    *
      * shadow volumes back from the game's write-only dynamic buffers;     *
      * in uncached (BAR) memory those reads cost tens of ms per frame.     */
-    { R"(\\shadow\.exe$)", {{
+    { R"(\\shadow(_lb)?\.exe$)", {{             /* shadow_lb.exe: the 4 GB copy (Make 4GB copy.bat) */
       { "d3d9.cachedWriteOnlyBuffers",      "True" },
     }} },
     /* Dead Space                                 *

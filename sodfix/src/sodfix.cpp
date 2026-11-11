@@ -15,7 +15,7 @@
 #include <vector>
 #include <algorithm>
 
-#define SODFIX_VERSION "0.14.0"
+#define SODFIX_VERSION "0.18.6"
 
 // ---------------------------------------------------------------- logging
 static FILE* g_log = nullptr;
@@ -48,6 +48,9 @@ struct Config {
     int  bars        = 1;      // CINEMATIC BARS row: 1 on (the game's letterbox in cutscenes), 0 off
     int  aoMode      = 0;      // AMBIENT OCCLUSION row: 0 off, 1 low, 2 high
     int  ssrMode     = 0;      // REFLECTIONS row: 0 off, 1 low, 2 high
+    int  upMode      = 3;      // TEXTURE UPSCALING row: 0 off, 1 2X, 2 3X, 3 4X
+    int  geomMode    = 0;      // IMPROVED GEOMETRY row: 0 off, 1 on
+    int  smoothCam   = 1;      // SMOOTH CAMERA row (DISPLAY SETTING): 1 on, 0 off
     int  kbLayout    = 0;      // CONTROLLER SETTING > LAYOUT (keyboard type only): 0 classic, 1 modern
 } g_cfg;
 
@@ -80,6 +83,11 @@ static void LoadConfig() {
     if (g_cfg.aoMode < 0 || g_cfg.aoMode > 2) g_cfg.aoMode = 0;
     g_cfg.ssrMode     = I("Display", "Reflections", 0);
     if (g_cfg.ssrMode < 0 || g_cfg.ssrMode > 2) g_cfg.ssrMode = 0;
+    g_cfg.upMode      = I("Display", "TextureUpscaling", 3);
+    if (g_cfg.upMode < 0 || g_cfg.upMode > 3) g_cfg.upMode = 3;
+    g_cfg.geomMode    = I("Display", "ImprovedGeometry", 0);
+    if (g_cfg.geomMode < 0 || g_cfg.geomMode > 1) g_cfg.geomMode = 0;
+    g_cfg.smoothCam   = I("Display", "SmoothCamera", 1) != 0;
     g_mode = g_cfg.mode;
 }
 static void SaveRt() {
@@ -104,6 +112,17 @@ static void SaveAo() {
 static void SaveSsr() {
     char v[8]; snprintf(v, sizeof v, "%d", g_cfg.ssrMode);
     WritePrivateProfileStringA("Display", "Reflections", v, g_ini);
+}
+static void SaveUp() {
+    char v[8]; snprintf(v, sizeof v, "%d", g_cfg.upMode);
+    WritePrivateProfileStringA("Display", "TextureUpscaling", v, g_ini);
+}
+static void SaveGeom() {
+    char v[8]; snprintf(v, sizeof v, "%d", g_cfg.geomMode);
+    WritePrivateProfileStringA("Display", "ImprovedGeometry", v, g_ini);
+}
+static void SaveSmoothCam() {
+    WritePrivateProfileStringA("Display", "SmoothCamera", g_cfg.smoothCam ? "1" : "0", g_ini);
 }
 static void SaveKb() {
     WritePrivateProfileStringA("Controls", "KeyboardLayout", g_cfg.kbLayout ? "1" : "0", g_ini);
@@ -242,6 +261,15 @@ static const SpriteRect kAoValue[3] = { { 887, 13991,  48,   0,  48, 32 },  // O
                                         { 887, 13991, 412, 366,  90, 32 } };// HIGH (0x5B)
 static const SpriteRect& kSsrTitle = kArt_REFLECTIONS;     // image 10 (texture 4999, new in 0.11)
 static const SpriteRect& kSsrHelp  = kArt_help_ssr;        // "Reflections on polished floors"
+static const SpriteRect& kUpTitle  = kArt_TEXTURE_UPSCALING; // image 10 (0.17)
+static const SpriteRect& kUpHelp   = kArt_help_up;         // "Sharper, more detailed textures"
+static const SpriteRect& kGeomTitle = kArt_IMPROVED_GEOMETRY; // image 10 (0.18)
+static const SpriteRect& kGeomHelp  = kArt_help_geom;       // "Seamless streets, no repeating tiles"
+static const SpriteRect kGeomValue[2] = { { 887, 13991, 48, 0, 48, 32 },   // OFF (game rect 0x0B)
+                                          { 887, 13991,  0, 0, 40, 32 } }; // ON  (game rect 0x0A)
+static const SpriteRect kUpValue[4] = { { 887, 13991, 48, 0, 48, 32 }, kArt_V2X, kArt_V3X, kArt_V4X };   // OFF (game rect 0x0B)
+static const SpriteRect& kScTitle = kArt_SMOOTH_CAMERA;    // image 10 (0.18.6)
+static const SpriteRect& kScHelp  = kArt_help_sc;          // "Steadier camera while walking"
 static const SpriteRect& kCbTitle = kArt_CINEMATIC_BARS;
 static const SpriteRect& kCbHelp  = kArt_help_cb;           // "Black bars in cutscenes"
 static const SpriteRect kCbValue[2] = { { 887, 13991,   0,   0,  40, 32 },  // ON  (game rect 0x0A)
@@ -261,15 +289,18 @@ static const int kCbId   = 20;                 // value slot obj+0xA4 (0 = ON, 1
 static const int kKbId   = 21;                 // value slot obj+0xA8 (0 = CLASSIC, 1 = MODERN)
 static const int kAoId   = 22;                 // value slot obj+0xAC (0 = OFF, 1 = LOW, 2 = HIGH)
 static const int kSsrId  = 23;                 // value slot obj+0xB0 (0 = OFF, 1 = LOW, 2 = HIGH)
-static const int kMenuObjSize = 0xB4;
-// GRAPHIC SETTING (page 3): 10 items + EXIT
-static RangeItem g_page3Items[10];
-static int16_t   g_page3Rows[11] = { 97, 120, 98, 99, 100, 124, 130, 134, 154, 158, 117 };
-static int16_t   g_page3Help[11] = { 73, 73, 74, 75, 76, 76, 76, 76, 76, 76, 62 };
-// DISPLAY SETTING (page 2): the game's 4 items (ids 6..9: table 0x939434) + CINEMATIC BARS + EXIT
-static RangeItem g_page2Items[5];
-static int16_t   g_page2Rows[6] = { 73, 75, 79, 83, 138, 89 };
-static int16_t   g_page2Help[6] = { 69, 70, 71, 72, 72, 62 };
+static const int kUpId   = 24;                 // value slot obj+0xB4 (0 = OFF, 1 = 2X, 2 = 3X, 3 = 4X)
+static const int kGeomId = 25;                 // value slot obj+0xB8 (0 = OFF, 1 = ON)
+static const int kScId   = 26;                 // value slot obj+0xBC (0 = ON, 1 = OFF, like CINEMATIC BARS)
+static const int kMenuObjSize = 0xC0;
+// GRAPHIC SETTING (page 3): 12 items + EXIT
+static RangeItem g_page3Items[12];
+static int16_t   g_page3Rows[13] = { 97, 120, 98, 99, 100, 124, 130, 134, 154, 158, 162, 166, 117 };
+static int16_t   g_page3Help[13] = { 73, 73, 74, 75, 76, 76, 76, 76, 76, 76, 76, 76, 62 };
+// DISPLAY SETTING (page 2): the game's 4 items (ids 6..9: table 0x939434) + CINEMATIC BARS + SMOOTH CAMERA + EXIT
+static RangeItem g_page2Items[6];
+static int16_t   g_page2Rows[7] = { 73, 75, 79, 83, 138, 170, 89 };
+static int16_t   g_page2Help[7] = { 69, 70, 71, 72, 72, 72, 62 };
 enum { SPR_TITLE = 120, SPR_TITLE_SH = 121, SPR_VALUE = 122, SPR_VALUE_SH = 123,
        SPR_RT_TITLE = 124, SPR_RT_TITLE_SH = 125, SPR_RT_VALUE = 126, SPR_RT_VALUE_SH = 127,
        SPR_SB_TRACK = 128, SPR_SB_THUMB = 129,
@@ -281,14 +312,18 @@ enum { SPR_TITLE = 120, SPR_TITLE_SH = 121, SPR_VALUE = 122, SPR_VALUE_SH = 123,
        SPR_KB_MODERN = 148, SPR_KB_MODERN_SH = 149, SPR_KB_LINE = 150,
        SPR_CB_OFF = 151, SPR_CB_OFF_SH = 152, SPR_CB_LINE = 153,
        SPR_AO_TITLE = 154, SPR_AO_TITLE_SH = 155, SPR_AO_VALUE = 156, SPR_AO_VALUE_SH = 157,
-       SPR_SSR_TITLE = 158, SPR_SSR_TITLE_SH = 159, SPR_SSR_VALUE = 160, SPR_SSR_VALUE_SH = 161, POOL_NEW = 162 };
+       SPR_SSR_TITLE = 158, SPR_SSR_TITLE_SH = 159, SPR_SSR_VALUE = 160, SPR_SSR_VALUE_SH = 161,
+       SPR_UP_TITLE = 162, SPR_UP_TITLE_SH = 163, SPR_UP_VALUE = 164, SPR_UP_VALUE_SH = 165,
+       SPR_GEOM_TITLE = 166, SPR_GEOM_TITLE_SH = 167, SPR_GEOM_VALUE = 168, SPR_GEOM_VALUE_SH = 169,
+       SPR_SC_TITLE = 170, SPR_SC_TITLE_SH = 171, SPR_SC_ON = 172, SPR_SC_ON_SH = 173, SPR_SC_OFF = 174, SPR_SC_OFF_SH = 175,
+       SPR_SC_LINE = 176, POOL_NEW = 177 };
 // CONTROLLER SETTING (page 0): TYPE + LAYOUT (keyboard only) + EXIT. The game reads the item count (code immediate)
 // and the row/help tables (pointers) every frame, so both are switched with TYPE.
 static RangeItem g_page0Items[2];
 static int16_t   g_page0Rows[3] = { 23, SPR_KB_TITLE, 26 };
 static int16_t   g_page0Help[3] = { 63, 63, 62 };
 // 5 visible rows (104..296): a 6th row at 344 put its highlight bar over the help panel (0.8.1)
-static const int kRowPitch = 48, kRow0Y = 104, kVisibleRows = 5, kMaxRows = 12;
+static const int kRowPitch = 48, kRow0Y = 104, kVisibleRows = 5, kMaxRows = 13;
 static const uintptr_t kPage0Count = 0x716FB5;   // mov edi, imm32 (CONTROLLER SETTING item count)
 static const uintptr_t kPage0RowsPtr = 0x939B00, kPage0HelpPtr = 0x939ABC;
 static const uintptr_t kPage0RowsOrig = 0x939AD8, kPage0HelpOrig = 0x939A94;
@@ -406,7 +441,7 @@ struct PageDef {
     int scroll;
 };
 static PageDef g_pages[] = {
-    { 3, 11, {
+    { 3, 13, {
         {  97,  93, 101, 102, -1 },                               // RESOLUTION
         { 120, 121, 122, 123, -1 },                               // SCREEN MODE
         {  98,  94, 103, 104, -1 },                               // DRAW DISTANCE
@@ -417,14 +452,17 @@ static PageDef g_pages[] = {
         { 134, 135, 136, 137, -1 },                               // TEXTURE FILTERING
         { 154, 155, 156, 157, -1 },                               // AMBIENT OCCLUSION
         { 158, 159, 160, 161, -1 },                               // REFLECTIONS
+        { 162, 163, 164, 165, -1 },                               // TEXTURE UPSCALING
+        { 166, 167, 168, 169, -1 },                               // IMPROVED GEOMETRY
         { 117, -1 } },                                            // EXIT
       { 98, 99, 100 }, { 94, 95, 96 }, { 2, 3, 4 }, 103, 104, 2, 109, SPR_SB_TRACK, SPR_SB_THUMB, 0 },
-    { 2, 6, {
+    { 2, 7, {
         {  73,  57,  74,  58, -1 },                               // TEXT DISPLAY
         {  75,  59,  76,  60,  77,  61,  78, -1 },                // COMPASS
         {  79,  62,  80,  63,  81,  64,  82, -1 },                // ITEM EMPHASIS
         {  83,  65,  84,  85,  86,  87,  88,  66, -1 },           // DOOR EMPHASIS
         { 138, 139, 140, 141, 151, 152, 153, -1 },                // CINEMATIC BARS (ON, OFF, underline like COMPASS)
+        { 170, 171, 172, 173, 174, 175, 176, -1 },                // SMOOTH CAMERA (same)
         {  89,  67, -1 } },                                       // EXIT
       { 75, 79, 83 }, { 59, 62, 65 }, { 1, 2, 3 }, 74, 58, 0, 78, SPR_SB2_TRACK, SPR_SB2_THUMB, 0 },
 };
@@ -632,6 +670,9 @@ static void __cdecl cb_MenuInit(uint8_t* obj) {
     *(int*)(obj + 0x54 + kKbId * 4) = g_cfg.kbLayout;
     *(int*)(obj + 0x54 + kAoId * 4) = g_cfg.aoMode;
     *(int*)(obj + 0x54 + kSsrId * 4) = g_cfg.ssrMode;
+    *(int*)(obj + 0x54 + kUpId * 4) = g_cfg.upMode;
+    *(int*)(obj + 0x54 + kGeomId * 4) = g_cfg.geomMode;
+    *(int*)(obj + 0x54 + kScId * 4) = g_cfg.smoothCam ? 0 : 1;
     g_p0Shift = 0;                                   // layout positions were just applied (0x7173D0)
     SetPage0Layout(*(int*)(obj + 0x54) == 0);
     memset(g_trackOk, 0, sizeof g_trackOk);
@@ -655,6 +696,9 @@ static void __cdecl cb_MenuFrame(uint8_t* obj) {
     int* cb   = (int*)(obj + 0x54 + kCbId * 4);
     int* ao   = (int*)(obj + 0x54 + kAoId * 4);
     int* ssr  = (int*)(obj + 0x54 + kSsrId * 4);
+    int* up   = (int*)(obj + 0x54 + kUpId * 4);
+    int* geom = (int*)(obj + 0x54 + kGeomId * 4);
+    int* smc  = (int*)(obj + 0x54 + kScId * 4);
     int* sc   = (int*)(obj + 0x90);                     // SHADOW CASTING value
     if (*mode < 0 || *mode > 1) *mode = ModeToMenu(g_mode);
     if (*rt < 0 || *rt > 3) *rt = 0;
@@ -663,6 +707,9 @@ static void __cdecl cb_MenuFrame(uint8_t* obj) {
     if (*cb < 0 || *cb > 1) *cb = 0;
     if (*ao < 0 || *ao > 2) *ao = 0;
     if (*ssr < 0 || *ssr > 2) *ssr = 0;
+    if (*up < 0 || *up > 3) *up = 3;
+    if (*geom < 0 || *geom > 1) *geom = 0;
+    if (*smc < 0 || *smc > 1) *smc = 0;
     g_menuMode = *mode;
 
     // RT SHADOW CASTING on -> SHADOW CASTING OFF; SHADOW CASTING back on -> RT SHADOW CASTING OFF
@@ -687,6 +734,10 @@ static void __cdecl cb_MenuFrame(uint8_t* obj) {
         g_cfg.bars = *cb == 0; SaveBars();
         Log("cinematic bars: %s", g_cfg.bars ? "on" : "off");
     }
+    if ((*smc == 0) != (g_cfg.smoothCam != 0)) {
+        g_cfg.smoothCam = *smc == 0; SaveSmoothCam();
+        Log("smooth camera: %s", g_cfg.smoothCam ? "on" : "off");
+    }
 
     Page0Frame(pool, obj, row0);
     // our rows (their templates already carry the scroll offset)
@@ -701,13 +752,17 @@ static void __cdecl cb_MenuFrame(uint8_t* obj) {
     BuildRowSprites(pool, g3, row, g3.rows[7], &kTfTitle, kArt_TEXTURE_FILTERING_yoff, &kTfValue[*tf], kTfValueYOff[*tf], 7);
     BuildRowSprites(pool, g3, row, g3.rows[8], &kAoTitle, kArt_AMBIENT_OCCLUSION_yoff, &kAoValue[*ao], 0, 8);
     BuildRowSprites(pool, g3, row, g3.rows[9], &kSsrTitle, kArt_REFLECTIONS_yoff, &kAoValue[*ssr], 0, 9);
+    BuildRowSprites(pool, g3, row, g3.rows[10], &kUpTitle, kArt_TEXTURE_UPSCALING_yoff, &kUpValue[*up], 0, 10);
+    BuildRowSprites(pool, g3, row, g3.rows[11], &kGeomTitle, kArt_IMPROVED_GEOMETRY_yoff, &kGeomValue[*geom], 0, 11);
     BuildRowSprites(pool, g2, row2, g2.rows[4], &kCbTitle, 1, GameRect(0x0A), 0, 4);
     BuildOnOffRow(pool, g2.rows[4], 4, *cb, *(int*)(obj + 0x70));
+    BuildRowSprites(pool, g2, row2, g2.rows[5], &kScTitle, kArt_SMOOTH_CAMERA_yoff, GameRect(0x0A), 0, 5);
+    BuildOnOffRow(pool, g2.rows[5], 5, *smc, *(int*)(obj + 0x70));
     // the icon y argument moves the icons twice as far as sprite pixels (seen in game: -48 put them 2 rows up)
     { int y = 0xF4 - g2.scroll * kRowPitch / 2; if (y != g_doorY) { WriteMem(kDoorIconY, &y, 4); g_doorY = y; } }
     // help line (sprite 118): our rect, centred like the game's own (0x776B30 mode 4: pivot = size / 2)
-    const SpriteRect* help = row == 1 ? &kModeHelp : row == 5 ? &kRtHelp : row == 6 ? &kAaHelp : row == 7 ? &kTfHelp : row == 8 ? &kAoHelp : row == 9 ? &kSsrHelp
-                           : row2 == 4 ? &kCbHelp : (row0 == 1 && g_p0Count == 2) ? &kArt_help_kb : nullptr;
+    const SpriteRect* help = row == 1 ? &kModeHelp : row == 5 ? &kRtHelp : row == 6 ? &kAaHelp : row == 7 ? &kTfHelp : row == 8 ? &kAoHelp : row == 9 ? &kSsrHelp : row == 10 ? &kUpHelp : row == 11 ? &kGeomHelp
+                           : row2 == 4 ? &kCbHelp : row2 == 5 ? &kScHelp : (row0 == 1 && g_p0Count == 2) ? &kArt_help_kb : nullptr;
     if (help) {
         uint8_t* h = Spr(pool, 118);
         *(const SpriteRect**)(h + 0x48) = help;
@@ -741,6 +796,16 @@ static void __cdecl cb_ApplySettings() {
         if (ssr >= 0 && ssr <= 2 && ssr != g_cfg.ssrMode) {
             Log("reflections: %d -> %d", g_cfg.ssrMode, ssr);
             g_cfg.ssrMode = ssr; SaveSsr();
+        }
+        int up = *(int*)(g_menuObj + 0x54 + kUpId * 4);
+        if (up >= 0 && up <= 3 && up != g_cfg.upMode) {
+            Log("texture upscaling: %d -> %d", g_cfg.upMode, up);
+            g_cfg.upMode = up; SaveUp();
+        }
+        int geom = *(int*)(g_menuObj + 0x54 + kGeomId * 4);
+        if (geom >= 0 && geom <= 1 && geom != g_cfg.geomMode) {
+            Log("improved geometry: %d -> %d", g_cfg.geomMode, geom);
+            g_cfg.geomMode = geom; SaveGeom();
         }
         int ao = *(int*)(g_menuObj + 0x54 + kAoId * 4);
         if (ao >= 0 && ao <= 2 && ao != g_cfg.aoMode) {
@@ -805,10 +870,13 @@ __declspec(dllexport) int __cdecl SoDFix_GetAntiAliasing() { return g_cfg.aaMode
 __declspec(dllexport) int __cdecl SoDFix_GetTextureFiltering() { return g_cfg.tfMode; }
 __declspec(dllexport) int __cdecl SoDFix_GetAmbientOcclusion() { return g_cfg.aoMode; }
 __declspec(dllexport) int __cdecl SoDFix_GetReflections() { return g_cfg.ssrMode; }
+__declspec(dllexport) int __cdecl SoDFix_GetTextureUpscaling() { return g_cfg.upMode; }
+__declspec(dllexport) int __cdecl SoDFix_GetImprovedGeometry() { return g_cfg.geomMode; }
 // the game's texture table: 40-byte entries indexed -16384..16383 (IDirect3DTexture8* at +0x10). Room draws refer to
 // pages (index > 0) and cut sub-textures (< 0) by these indices (sod/ssr/NOTES.md); 0 = unsupported exe
 __declspec(dllexport) uintptr_t __cdecl SoDFix_GetTextureTable() { return g_patchesActive ? *(uintptr_t*)0xAB3998 : 0; }
 __declspec(dllexport) int __cdecl SoDFix_GetCinematicBars() { return g_cfg.bars ? 1 : 0; }
+__declspec(dllexport) int __cdecl SoDFix_GetSmoothCamera() { return g_cfg.smoothCam ? 1 : 0; }
 __declspec(dllexport) uint32_t __cdecl SoDFix_GetPresentSite() { return g_presentSite; }
 
 } // extern "C"
@@ -975,33 +1043,36 @@ static void BuildPatches() {
         g_page3Items[7] = { 0, 2, (int16_t)kTfId };
         g_page3Items[8] = { 0, 2, (int16_t)kAoId };
         g_page3Items[9] = { 0, 2, (int16_t)kSsrId };
-        Add("page3 item count 4->10", 0x716FC1, U32(4), U32(10));
+        g_page3Items[10] = { 0, 3, (int16_t)kUpId };
+        g_page3Items[11] = { 0, 1, (int16_t)kGeomId };
+        Add("page3 item count 4->12", 0x716FC1, U32(4), U32(12));
         Add("page3 item table",       0x716FC6, U32(0x939408), U32((uint32_t)(uintptr_t)g_page3Items));
         Add("page3 row sprites",      A::Page3Rows, U32(0x939AF0), U32((uint32_t)(uintptr_t)g_page3Rows));
         Add("page3 help rows",        A::Page3Help, U32(0x939AAC), U32((uint32_t)(uintptr_t)g_page3Help));
-        // DISPLAY SETTING (page 2): CINEMATIC BARS row after DOOR EMPHASIS, EXIT 312 -> 344 (layout entry 45)
+        // DISPLAY SETTING (page 2): CINEMATIC BARS + SMOOTH CAMERA after DOOR EMPHASIS, EXIT 312 -> 392 (layout entry 45)
         memcpy(g_page2Items, (const void*)0x939434, 4 * sizeof(RangeItem));
         g_page2Items[4] = { 0, 1, (int16_t)kCbId };
-        Add("page2 item count 4->5",  0x716FCD, U32(4), U32(5));
+        g_page2Items[5] = { 0, 1, (int16_t)kScId };
+        Add("page2 item count 4->6",  0x716FCD, U32(4), U32(6));
         Add("page2 item table",       0x716FD2, U32(0x939434), U32((uint32_t)(uintptr_t)g_page2Items));
         Add("page2 row sprites",      A::Page2Rows, U32(0x939AE4), U32((uint32_t)(uintptr_t)g_page2Rows));
         Add("page2 help rows",        A::Page2Help, U32(0x939AA0), U32((uint32_t)(uintptr_t)g_page2Help));
         Add("door icons y (runtime)",  kDoorIconY, U32(0xF4), U32(0xF4));
-        Add("page2 EXIT row",         A::Layout + 45 * 8 + 6, U16(312), U16(344));
-        Add("menu object 0x94->0xB4", 0x716631, U32(0x94), U32(kMenuObjSize));
+        Add("page2 EXIT row",         A::Layout + 45 * 8 + 6, U16(312), U16(392));
+        Add("menu object 0x94->0xC0", 0x716631, U32(0x94), U32(kMenuObjSize));
         // sprite pool 120 -> 151 (push imm8 can't hold 130: call a stub that pushes the count)
         { Asm s(NextStub()); s.raw({ 0x58, 0x68 }).u32(POOL_NEW).raw({ 0x50 }).jmp(0x776AB0); uintptr_t st = Emit(s);
           std::vector<uint8_t> r = { 0xE8 }; auto rel = Rel32(0x71675F, st); r.insert(r.end(), rel.begin(), rel.end()); r.push_back(0x90); r.push_back(0x90);
-          Add("sprite pool alloc 120->162", 0x71675E, { 0x6A, 0x78, 0xE8, 0x4B, 0x03, 0x06, 0x00 }, r); }
+          Add("sprite pool alloc 120->177", 0x71675E, { 0x6A, 0x78, 0xE8, 0x4B, 0x03, 0x06, 0x00 }, r); }
         { Asm s(NextStub());
           s.raw({ 0x58, 0x68 }).u32(POOL_NEW).raw({ 0x50, 0x60, 0x56 }).callAbs(&p_MenuFrame).raw({ 0x83, 0xC4, 0x04, 0x61 }).jmp(A::SpriteDraw);
           uintptr_t st = Emit(s);
           std::vector<uint8_t> r = { 0xE8 }; auto rel = Rel32(0x716931, st); r.insert(r.end(), rel.begin(), rel.end()); r.push_back(0x90); r.push_back(0x90);
-          Add("sprite pool draw 120->162 + frame hook", 0x716930, { 0x6A, 0x78, 0xE8, 0x19, 0x03, 0x06, 0x00 }, r); }
+          Add("sprite pool draw 120->177 + frame hook", 0x716930, { 0x6A, 0x78, 0xE8, 0x19, 0x03, 0x06, 0x00 }, r); }
         // rows: RES 104, SCREEN MODE 152, DRAW 200, FOCUS 248, SHADOW 296, RT SHADOW CASTING 344, ANTI-ALIASING 392,
-        // TEXTURE FILTERING 440, AMBIENT OCCLUSION 488, REFLECTIONS 536, EXIT 584 (5 visible, scrolled into view)
+        // TEXTURE FILTERING 440, AMBIENT OCCLUSION 488, REFLECTIONS 536, TEXTURE UPSCALING 584, IMPROVED GEOMETRY 632, EXIT 680 (5 visible, scrolled into view)
         struct { int entry; int16_t from, to; } mv[] = {
-            {48,152,200},{49,200,248},{50,248,296},{51,312,584},
+            {48,152,200},{49,200,248},{50,248,296},{51,312,680},
             {53,152,200},{54,200,248},{55,200,248},{56,248,296},{57,248,296},{58,248,296} };
         for (auto& m : mv) Add("layout row shift", A::Layout + m.entry * 8 + 6, U16((uint16_t)m.from), U16((uint16_t)m.to));
         { Asm s(NextStub());

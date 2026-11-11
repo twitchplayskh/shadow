@@ -10,6 +10,8 @@ namespace dxvk {
     const D3D9_BUFFER_DESC*  pDesc)
     : m_parent ( pDevice ), m_desc ( *pDesc ),
       m_mapMode(DetermineMapMode(pDevice->GetOptions())) {
+    static std::atomic<uint64_t> s_sodUid = { 0ull };
+    m_sodUid = ++s_sodUid;
     m_buffer = CreateBuffer();
     if (m_mapMode == D3D9_COMMON_BUFFER_MAP_MODE_BUFFER)
       m_stagingBuffer = CreateStagingBuffer();

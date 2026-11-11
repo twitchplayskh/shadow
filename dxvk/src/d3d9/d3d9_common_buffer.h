@@ -173,6 +173,11 @@ namespace dxvk {
     }
     inline uint32_t GetLockCount() const { return m_lockCount; }
 
+    // SoD: identity + write generation, so derived data (improved geometry's split index lists) can be cached
+    inline uint64_t SodUid() const { return m_sodUid; }
+    inline uint32_t SodWriteGen() const { return m_sodWriteGen; }
+    inline void SodBumpWriteGen() { m_sodWriteGen++; }
+
     /**
      * \brief Whether or not the staging buffer needs to be copied to the actual buffer
      */
@@ -244,6 +249,9 @@ namespace dxvk {
     uint32_t                    m_lockCount = 0;
 
     uint64_t                    m_seq = 0ull;
+
+    uint64_t                    m_sodUid = 0ull;
+    uint32_t                    m_sodWriteGen = 0u;
 
   };
 
