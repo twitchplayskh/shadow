@@ -7,6 +7,36 @@
 
 namespace dxvk {
 
+  // SoD HDR: Windows' "SDR content brightness" for the monitor the window is on, in nits (0 if unknown). Standard-range
+  // content on an HDR desktop is shown at this white level, so HDR uses it as paper white to look the same as HDR off.
+  static float SodSdrWhiteNits(HWND window) {
+    HMONITOR mon = ::MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi = { }; mi.cbSize = sizeof mi;
+    if (!mon || !::GetMonitorInfoW(mon, &mi)) return 0.0f;
+    UINT32 nPaths = 0, nModes = 0;
+    if (::GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes) != ERROR_SUCCESS) return 0.0f;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
+    if (::QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(), &nModes, modes.data(), nullptr) != ERROR_SUCCESS) return 0.0f;
+    for (UINT32 i = 0; i < nPaths; i++) {
+      DISPLAYCONFIG_SOURCE_DEVICE_NAME src = { };
+      src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+      src.header.size = sizeof src;
+      src.header.adapterId = paths[i].sourceInfo.adapterId;
+      src.header.id = paths[i].sourceInfo.id;
+      if (::DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, mi.szDevice)) continue;
+      DISPLAYCONFIG_SDR_WHITE_LEVEL wl = { };
+      wl.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+      wl.header.size = sizeof wl;
+      wl.header.adapterId = paths[i].targetInfo.adapterId;
+      wl.header.id = paths[i].targetInfo.id;
+      if (::DisplayConfigGetDeviceInfo(&wl.header) != ERROR_SUCCESS) return 0.0f;
+      return float(wl.SDRWhiteLevel) * 80.0f / 1000.0f;
+    }
+    return 0.0f;
+  }
+
+
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
@@ -851,6 +881,39 @@ namespace dxvk {
     if (m_latencyTracker)
       m_latencyTracker->notifyCpuPresentBegin(m_wctx->frameId + 1u);
 
+    // SoD HDR: switch the swap chain between HDR10 and standard range with the setting (Windows HDR must be on)
+    { const bool want = m_parent->m_sodRt.Hdr() > 0;
+      if (want != m_sodHdr && m_wctx) {
+        if (want && !m_wctx->presenter->supportsColorSpace(env::getEnvVar("SODRT_HDR_HDR10") == "1" ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)) {
+          if (!m_sodHdrWarned) { m_sodHdrWarned = true;
+            Logger::warn("SoD-RT: HDR: the display does not offer HDR (turn on HDR in Windows display settings); staying in standard range"); }
+        } else {
+          // the render thread may still be presenting with the old format: let it finish first
+          // No render-thread sync or device idle here: the presenter recreates the swap chain at its next acquire
+          // (it waits for the pending present itself), as DXVK's own colour space switch does. Waiting for the
+          // device here left the game's image reading back as black in the HDR pass.
+          static const bool doSync = env::getEnvVar("SODRT_HDR_SYNC") == "1";   // test switch: the old behaviour
+          if (doSync) {
+            m_parent->SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
+            m_device->waitForIdle();
+          }
+          m_sodHdr = want; m_sodHdrWarned = false;
+          m_wctx->presenter->setSurfaceFormat(GetSurfaceFormat());
+          if (want) {
+            static const float envPaper = [] { std::string e = env::getEnvVar("SODRT_HDR_PAPER"); return e.empty() ? 0.0f : std::stof(e); }();
+            const float win = SodSdrWhiteNits(m_window);
+            const float set = m_parent->m_sodRt.HdrPaperNits();           // HdrPaperWhite, 0 = follow Windows
+            m_sodPaper = envPaper > 0.0f ? envPaper : win > 0.0f ? win : 200.0f;   // used while HdrPaperWhite is 0
+            Logger::info(str::format("SoD-RT: HDR paper white ", m_sodPaper, " nits (Windows SDR content brightness ", win,
+              " nits, HdrPaperWhite ", set, "), peak ", m_parent->m_sodRt.HdrPeakNits(), " nits, highlight ",
+              m_parent->m_sodRt.HdrHighlight() * 100.0f, "%, gamma ", m_parent->m_sodRt.HdrGamma(), ", saturation ",
+              m_parent->m_sodRt.HdrSaturation() * 100.0f, "%"));
+          }
+          Logger::info(str::format("SoD-RT: HDR ", want ? "on" : "off", ": Windows white ", m_sodPaper,
+            " nits, peak ", m_parent->m_sodRt.HdrPeakNits(), " nits"));
+        }
+      } }
+
     // Retrieve the image and image view to present
     VkResult status = VK_SUCCESS;
 
@@ -898,8 +961,19 @@ namespace dxvk {
         cDstRect        = dstRect,
         cSync           = sync,
         cFrameId        = m_wctx->frameId,
-        cLatency        = m_latencyTracker
+        cLatency        = m_latencyTracker,
+        cHdr            = m_sodHdr,
+        cPaper          = m_parent->m_sodRt.HdrPaperNits() > 0.0f ? m_parent->m_sodRt.HdrPaperNits()   // live: the calibration screen
+                        : m_sodPaper > 0.0f ? m_sodPaper : 200.0f,
+        cGamma          = m_parent->m_sodRt.HdrGamma(),
+        cSat            = m_parent->m_sodRt.HdrSaturation(),
+        cHighlight      = m_parent->m_sodRt.HdrHighlight(),
+        cPeak           = m_parent->m_sodRt.HdrPeakNits(),
+        cDebug          = m_parent->m_sodRt.HdrDebug(),
+        cGlow           = m_sodHdr ? m_parent->SodGlowView() : Rc<DxvkImageView>()
       ] (DxvkContext* ctx) {
+        sodSetHdr(cHdr, cPaper, cPeak, cDebug, cGamma, cHighlight, cSat);          // SoD HDR: read by the blitter's present below
+        sodSetHdrGlow(cGlow);
         // Update back buffer color space as necessary
         if (cSrcView->image()->info().colorSpace != cColorSpace) {
           DxvkImageUsageInfo usage = { };
@@ -1166,6 +1240,12 @@ namespace dxvk {
 
   VkSurfaceFormatKHR D3D9SwapChainEx::GetSurfaceFormat() {
     D3D9Format format = EnumerateFormat(m_presentParams.BackBufferFormat);
+    if (m_sodHdr) {                                      // SoD HDR: scRGB (FP16 linear), the HDR pass's own output;
+      static const bool hdr10 = env::getEnvVar("SODRT_HDR_HDR10") == "1";   // HDR10 with SODRT_HDR_HDR10=1
+      if (!hdr10)                                        // (HDR10 did not reach the screen with the descriptor heap)
+        return { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT };
+      return { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT };
+    }
 
     switch (format) {
       default:

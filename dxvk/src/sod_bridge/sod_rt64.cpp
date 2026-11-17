@@ -424,6 +424,8 @@ struct Slot {
     LightAS las[SOD_MAX_LIGHTS];
     VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
     VkDescriptorSet ds = VK_NULL_HANDLE;
+    uint32_t instCount = 0;                         // TLAS instances: one per light, + the world
+    bool world = false;
 };
 
 static const VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -545,14 +547,14 @@ static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb, u
     }
     // TLAS for up to SOD_MAX_LIGHTS instances (created once per slot)
     if (!sl.tlas) {
-        if (!MakeBuffer(sl.inst, SOD_MAX_LIGHTS * sizeof(VkAccelerationStructureInstanceKHR), kAsIn, kHost)) return false;
+        if (!MakeBuffer(sl.inst, (SOD_MAX_LIGHTS + 1) * sizeof(VkAccelerationStructureInstanceKHR), kAsIn, kHost)) return false;
         VkAccelerationStructureGeometryKHR tg = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
         tg.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
         tg.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
         tg.geometry.instances.data.deviceAddress = sl.inst.addr;
         VkAccelerationStructureBuildGeometryInfoKHR tb = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
         tb.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR; tb.geometryCount = 1; tb.pGeometries = &tg;
-        uint32_t maxInst = SOD_MAX_LIGHTS;
+        uint32_t maxInst = SOD_MAX_LIGHTS + 1;
         VkAccelerationStructureBuildSizesInfoKHR ts = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
         vkGetAccelerationStructureBuildSizesKHR_(g_dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &maxInst, &ts);
         if (!MakeBuffer(sl.tlasBuf, ts.accelerationStructureSize, kAsSt, kGpu)) return false;
@@ -565,6 +567,120 @@ static bool EnsureSlotBuffers(Slot& sl, const SodGeomFrame& g, FrameBuild& fb, u
     g_histReq[slot] = reqIdx;
     if (((g_statBuilds + g_statRefits) % 3000u) < fb.count && fb.count)
         Log("BLAS: %llu refits, %llu full builds so far", (unsigned long long)g_statRefits, (unsigned long long)g_statBuilds);
+    return true;
+}
+
+// ---- world shadows: the area's room / street geometry, one BLAS shared by every request (rebuilt when the
+// area changes), plus its baked vertex colours for the shader (binding 8)
+struct World {
+    HANDLE map = nullptr;
+    const uint8_t* view = nullptr;
+    uint32_t generation = 0, tris = 0;
+    float litRef = 0.5f;
+    Buf staging, verts, cols, blasBuf, scratch;
+    VkDeviceSize vertCap = 0, colCap = 0, blasCap = 0, scratchCap = 0;
+    VkAccelerationStructureKHR as = VK_NULL_HANDLE;
+    VkDeviceAddress addr = 0;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    uint32_t lastTry = 0;
+};
+static World g_world;
+struct Encl { bool enclosed = false; uint32_t closedRun = 0, openRun = 0; };
+static Encl g_encl[SOD_MAX_LIGHTS];
+
+// call with the queue idle (nothing in flight may use the old world). Returns true when the world changed.
+static bool LoadWorld(uint32_t gen) {
+    World& w = g_world;
+    const SodWorldHeader* h = (const SodWorldHeader*)w.view;
+    const uint32_t half = gen & 1u, n = h->triCount[half];
+    if (n == 0 || n > SOD_WORLD_MAX_TRIS) { w.tris = 0; w.generation = gen; return true; }
+    const uint8_t* src = w.view + sizeof(SodWorldHeader) + size_t(half) * SOD_WORLD_HALF_BYTES;
+    const VkDeviceSize vb = VkDeviceSize(n) * 36, cbytes = VkDeviceSize(n) * 12;
+    if (!w.pool) {
+        VkCommandPoolCreateInfo cpci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpci.queueFamilyIndex = g_family;
+        if (vkCreateCommandPool_(g_dev, &cpci, nullptr, &w.pool) != VK_SUCCESS) return false;
+        VkCommandBufferAllocateInfo cba = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cba.commandPool = w.pool; cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cba.commandBufferCount = 1;
+        vkAllocateCommandBuffers_(g_dev, &cba, &w.cb);
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        vkCreateFence_(g_dev, &fci, nullptr, &w.fence);
+    }
+    if (vb + cbytes > w.vertCap + w.colCap || !w.staging.buf) {
+        FreeBuf(w.staging); FreeBuf(w.verts); FreeBuf(w.cols);
+        VkDeviceSize vcap = vb + vb / 4 + 4096, ccap = cbytes + cbytes / 4 + 4096;
+        if (!MakeBuffer(w.staging, vcap + ccap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, kHost)) return false;
+        if (!MakeBuffer(w.verts, vcap, kAsIn | VK_BUFFER_USAGE_TRANSFER_DST_BIT, kGpu)) return false;
+        if (!MakeBuffer(w.cols, ccap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, kGpu)) return false;
+        w.vertCap = vcap; w.colCap = ccap;
+    }
+    memcpy(w.staging.map, src, size_t(vb));
+    memcpy((uint8_t*)w.staging.map + w.vertCap, src + size_t(SOD_WORLD_MAX_TRIS) * 36, size_t(cbytes));
+    const float litRef = h->litRef[half];
+    // the writer must not have overwritten this half while it was copied (it writes the other half first)
+    if (h->generation > gen + 1) return false;
+
+    VkAccelerationStructureGeometryKHR ge = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+    ge.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR; ge.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    ge.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    ge.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    ge.geometry.triangles.vertexData.deviceAddress = w.verts.addr;
+    ge.geometry.triangles.vertexStride = 12;
+    ge.geometry.triangles.maxVertex = n * 3 - 1;
+    ge.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+    VkAccelerationStructureBuildGeometryInfoKHR bg = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+    bg.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bg.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bg.geometryCount = 1; bg.pGeometries = &ge;
+    VkAccelerationStructureBuildSizesInfoKHR bs = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+    vkGetAccelerationStructureBuildSizesKHR_(g_dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bg, &n, &bs);
+    if (bs.accelerationStructureSize > w.blasCap || !w.as) {
+        if (w.as) vkDestroyAccelerationStructureKHR_(g_dev, w.as, nullptr);
+        w.as = VK_NULL_HANDLE;
+        FreeBuf(w.blasBuf);
+        VkDeviceSize cap = bs.accelerationStructureSize + bs.accelerationStructureSize / 4 + 65536;
+        if (!MakeBuffer(w.blasBuf, cap, kAsSt, kGpu)) return false;
+        VkAccelerationStructureCreateInfoKHR aci = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
+        aci.buffer = w.blasBuf.buf; aci.size = cap; aci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        if (vkCreateAccelerationStructureKHR_(g_dev, &aci, nullptr, &w.as) != VK_SUCCESS) return false;
+        w.blasCap = cap;
+        VkAccelerationStructureDeviceAddressInfoKHR dai = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
+        dai.accelerationStructure = w.as;
+        w.addr = vkGetAccelerationStructureDeviceAddressKHR_(g_dev, &dai);
+    }
+    if (bs.buildScratchSize + 256 > w.scratchCap) {
+        FreeBuf(w.scratch);
+        VkDeviceSize cap = bs.buildScratchSize + 65536;
+        if (!MakeBuffer(w.scratch, cap, kScr, kGpu)) return false;
+        w.scratchCap = cap;
+    }
+    bg.dstAccelerationStructure = w.as;
+    bg.scratchData.deviceAddress = (w.scratch.addr + 255) & ~VkDeviceAddress(255);
+    vkResetCommandBuffer_(w.cb, 0);
+    VkCommandBufferBeginInfo cbb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer_(w.cb, &cbb);
+    VkBufferCopy c0 = { 0, 0, vb }, c1 = { w.vertCap, 0, cbytes };
+    vkCmdCopyBuffer_(w.cb, w.staging.buf, w.verts.buf, 1, &c0);
+    vkCmdCopyBuffer_(w.cb, w.staging.buf, w.cols.buf, 1, &c1);
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier_(w.cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkAccelerationStructureBuildRangeInfoKHR range = { n, 0, 0, 0 };
+    const VkAccelerationStructureBuildRangeInfoKHR* pr = &range;
+    vkCmdBuildAccelerationStructuresKHR_(w.cb, 1, &bg, &pr);
+    AsBarrier(w.cb, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    vkEndCommandBuffer_(w.cb);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &w.cb;
+    vkResetFences_(g_dev, 1, &w.fence);
+    if (vkQueueSubmit_(g_queue, 1, &si, w.fence) != VK_SUCCESS) return false;
+    vkWaitForFences_(g_dev, 1, &w.fence, VK_TRUE, 5000000000ull);
+    w.tris = n; w.litRef = litRef; w.generation = gen;
+    Log("world shadows: area geometry %u tris (lit reference %.2f), BLAS %.1f MB", n, litRef, double(bs.accelerationStructureSize) / 1048576.0);
     return true;
 }
 
@@ -583,7 +699,8 @@ static void Serve(HANDLE parentProc) {
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     smi.codeSize = sizeof kRtMaskSpv; smi.pCode = kRtMaskSpv;
     VkShaderModule sm; if (vkCreateShaderModule_(g_dev, &smi, nullptr, &sm) != VK_SUCCESS) { LinkFail("shader module"); return; }
-    VkDescriptorSetLayoutBinding bnd[8] = {
+    VkDescriptorSetLayoutBinding bnd[9] = {
+        { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // world: baked vertex colours
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // soft: hit bits
         { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // soft: cone result
         { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // soft: tiles
@@ -592,9 +709,9 @@ static void Serve(HANDLE parentProc) {
         { 2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr } };
-    VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO }; dli.bindingCount = 8; dli.pBindings = bnd;
+    VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO }; dli.bindingCount = 9; dli.pBindings = bnd;
     VkDescriptorSetLayout dsl; vkCreateDescriptorSetLayout_(g_dev, &dli, nullptr, &dsl);
-    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 };
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 20 };
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; vkCreatePipelineLayout_(g_dev, &pli, nullptr, &pl);
@@ -602,10 +719,12 @@ static void Serve(HANDLE parentProc) {
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cpi.stage.module = sm; cpi.stage.pName = "main"; cpi.layout = pl;
     VkPipeline pipe; if (vkCreateComputePipelines_(g_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe) != VK_SUCCESS) { LinkFail("pipeline"); return; }
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7 * SOD_BRIDGE_SLOTS }, { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, SOD_BRIDGE_SLOTS } };
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 * SOD_BRIDGE_SLOTS }, { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, SOD_BRIDGE_SLOTS } };
     VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO }; dpi.maxSets = SOD_BRIDGE_SLOTS; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
     VkDescriptorPool dp; vkCreateDescriptorPool_(g_dev, &dpi, nullptr, &dp);
-    Buf counts; if (!MakeBuffer(counts, 4 * SOD_BRIDGE_SLOTS, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost)) { LinkFail("count buffer"); return; }
+    Buf counts; if (!MakeBuffer(counts, 128 * SOD_BRIDGE_SLOTS, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost)) { LinkFail("count buffer"); return; }
+    Buf noWorld; if (!MakeBuffer(noWorld, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHost)) { LinkFail("world dummy buffer"); return; }
+    char wname[64]; snprintf(wname, sizeof wname, SOD_BRIDGE_WORLD "%lu", (unsigned long)g_shared->parentPid);
 
     VkCommandPoolCreateInfo cpci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpci.queueFamilyIndex = g_family;
@@ -641,8 +760,20 @@ static void Serve(HANDLE parentProc) {
     auto complete = [&](uint32_t s) {                  // fence of slot s signalled: publish results
         Slot& sl = slots[s];
         if (!sl.pendingValue) return;
-        const uint32_t* c = (const uint32_t*)counts.map;
-        g_shared->resultCount[s] = c[s];
+        const uint32_t* c = (const uint32_t*)counts.map + 32 * s;
+        g_shared->resultCount[s] = c[0];
+        // world shadows: lights the area blocks almost everywhere are enclosed (a shop's "sun"): the area stops
+        // darkening for them; it starts again when the probe sees them mostly open. A few frames either way.
+        if (sl.world) for (uint32_t l = 0; l < sl.softBucket && l < SOD_MAX_LIGHTS; l++) {
+            const uint32_t tested = c[1 + l], blocked = c[9 + l];
+            if (tested < 200) continue;
+            const float fr = float(blocked) / float(tested);
+            Encl& e = g_encl[l];
+            if (fr > 0.6f)       { e.closedRun++; e.openRun = 0; }
+            else if (fr < 0.4f)  { e.openRun++; e.closedRun = 0; }
+            if (!e.enclosed && e.closedRun >= 3) { e.enclosed = true;  Log("world shadows: light %u enclosed (%.0f %% of the view blocked by the area): area shadows off for it", l, fr * 100.0f); }
+            if (e.enclosed && e.openRun >= 6)    { e.enclosed = false; Log("world shadows: light %u open again (%.0f %% blocked): area shadows on", l, fr * 100.0f); }
+        }
         MemoryBarrier();
         g_shared->resultValue[s] = sl.pendingValue + 1;
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
@@ -706,6 +837,17 @@ static void Serve(HANDLE parentProc) {
             vkUpdateDescriptorSets_(g_dev, 7, wr, 0, nullptr);
         }
     };
+
+    auto bindWorld = [&]() {
+        for (uint32_t i = 0; i < SOD_BRIDGE_SLOTS; i++) {
+            VkDescriptorBufferInfo bi = { g_world.tris ? g_world.cols.buf : noWorld.buf, 0, VK_WHOLE_SIZE };
+            VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            wr.dstSet = slots[i].ds; wr.dstBinding = 8; wr.descriptorCount = 1;
+            wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr.pBufferInfo = &bi;
+            vkUpdateDescriptorSets_(g_dev, 1, &wr, 0, nullptr);
+        }
+    };
+    bindWorld();
 
     static FrameBuild fb;
     uint32_t tracedLogs = 0;
@@ -805,15 +947,39 @@ static void Serve(HANDLE parentProc) {
             Slot& sl = slots[s];
             if (sl.pendingValue) { vkWaitForFences_(g_dev, 1, &sl.fence, VK_TRUE, 2000000000ull); complete(s); }
             const SodGeomFrame& g = *(const SodGeomFrame*)(geom + size_t(s) * SOD_GEOM_SLOT_BYTES);
-            bool trace = r.hasGeometry && g.magic == SOD_GEOM_MAGIC && g.triCount > 0 && g.triCount <= SOD_GEOM_MAX_TRIS
-                      && g.casterCount > 0 && g.casterCount <= SOD_MAX_CASTERS && g.lightCount > 0 && g.lightCount <= SOD_MAX_LIGHTS
+            // world shadows: open the world mapping, and load a new area's geometry (queue idle first: the
+            // requests in flight still use the old world's BLAS and colours)
+            bool worldNow = false;
+            if (g.flags & SOD_GEOM_FLAG_WORLD) {
+                if (!g_world.view && (g_world.lastTry++ % 30u) == 0u) {
+                    g_world.map = OpenFileMappingA(FILE_MAP_READ, FALSE, wname);
+                    if (g_world.map) g_world.view = (const uint8_t*)MapViewOfFile(g_world.map, FILE_MAP_READ, 0, 0, 0);
+                }
+                if (g_world.view) {
+                    const SodWorldHeader* wh = (const SodWorldHeader*)g_world.view;
+                    uint32_t gen = wh->generation;
+                    if (wh->magic == SOD_WORLD_MAGIC && gen != 0 && gen != g_world.generation) {
+                        vkDeviceWaitIdle_(g_dev);
+                        for (uint32_t k = 0; k < SOD_BRIDGE_SLOTS; k++) complete(k);
+                        if (!LoadWorld(gen)) Log("world shadows: area geometry %u not loaded (changed while reading, or out of memory)", gen);
+                        bindWorld();
+                    }
+                    worldNow = g_world.tris > 0 && g_world.as != VK_NULL_HANDLE;
+                }
+            }
+            // lamp-only frame (lamp lighting in a room without game shadows): no casters or lights, only lamps
+            const bool lampOnly = r.hasGeometry && g.magic == SOD_GEOM_MAGIC && g.lampCount > 0 && g.lampCount <= SOD_MAX_LAMPS
+                      && (g.casterCount == 0 || g.lightCount == 0 || g.triCount == 0);
+            bool trace = r.hasGeometry && g.magic == SOD_GEOM_MAGIC && g.triCount <= SOD_GEOM_MAX_TRIS
+                      && g.casterCount <= SOD_MAX_CASTERS && g.lightCount <= SOD_MAX_LIGHTS
+                      && (lampOnly || (g.triCount > 0 && g.casterCount > 0 && g.lightCount > 0))
                       && g.width == r.width && g.height == r.height && r.width * r.height * 4 <= depth.size
                       && r.width <= scratchW && r.height <= scratchH && size_t(r.width) * r.height <= size_t(scratchW) * scratchH;
             if (trace) {
                 for (uint32_t c = 0; c < g.casterCount && trace; c++)
                     trace = g.casters[c].triCount > 0 && g.casters[c].firstTri + g.casters[c].triCount <= g.triCount;
                 if (trace && !EnsureSlotBuffers(sl, g, fb, s, next >> 1)) break;
-                trace = trace && fb.count > 0;
+                trace = trace && (fb.count > 0 || lampOnly);
             }
             if (trace) {
                 memcpy(sl.frame.map, &g, sizeof g);
@@ -827,15 +993,26 @@ static void Serve(HANDLE parentProc) {
                     softNow = k >= 4; softSamples = k;
                 } else softNow = false;
                 sl.softBucket = g.lightCount; sl.softK = softNow ? softSamples : 0;
-                memcpy(sl.staging.map, (const uint8_t*)&g + sizeof(SodGeomFrame), size_t(g.triCount) * 36);
-                VkAccelerationStructureInstanceKHR ins[SOD_MAX_LIGHTS] = { };
+                if (g.triCount) memcpy(sl.staging.map, (const uint8_t*)&g + sizeof(SodGeomFrame), size_t(g.triCount) * 36);
+                VkAccelerationStructureInstanceKHR ins[SOD_MAX_LIGHTS + 1] = { };
                 for (uint32_t b = 0; b < fb.count; b++) {
                     ins[b].transform.matrix[0][0] = ins[b].transform.matrix[1][1] = ins[b].transform.matrix[2][2] = 1.0f;
                     ins[b].mask = uint8_t(1u << fb.light[b]);
                     ins[b].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
                     ins[b].accelerationStructureReference = sl.las[b].addr;
                 }
-                memcpy(sl.inst.map, ins, sizeof(VkAccelerationStructureInstanceKHR) * fb.count);
+                sl.instCount = fb.count;
+                if (worldNow) {                    // the area: one more instance, custom index 1, ray mask 0x80
+                    VkAccelerationStructureInstanceKHR& wi = ins[fb.count];
+                    wi.transform.matrix[0][0] = wi.transform.matrix[1][1] = wi.transform.matrix[2][2] = 1.0f;
+                    wi.instanceCustomIndex = 1;
+                    wi.mask = 0x80;
+                    wi.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+                    wi.accelerationStructureReference = g_world.addr;
+                    sl.instCount++;
+                }
+                sl.world = worldNow;
+                memcpy(sl.inst.map, ins, sizeof(VkAccelerationStructureInstanceKHR) * sl.instCount);
                 VkWriteDescriptorSetAccelerationStructureKHR wa = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
                 wa.accelerationStructureCount = 1; wa.pAccelerationStructures = &sl.tlas;
                 VkWriteDescriptorSet wd = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &wa };
@@ -856,8 +1033,10 @@ static void Serve(HANDLE parentProc) {
                 vkCmdWriteTimestamp_(cbB, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 4 * s);
             }
             if (trace) {
+              if (g.triCount > 0) {
                 VkBufferCopy cp = { 0, 0, VkDeviceSize(g.triCount) * 36 };
                 vkCmdCopyBuffer_(cbB, sl.staging.buf, sl.verts.buf, 1, &cp);
+              }
                 // the copy, and earlier requests' BLAS builds (refit sources; also their reads of a BLAS this
                 // build now overwrites) -> this build
                 VkMemoryBarrier vb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -865,7 +1044,7 @@ static void Serve(HANDLE parentProc) {
                 vb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
                 vkCmdPipelineBarrier_(cbB, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &vb, 0, nullptr, 0, nullptr);
-                vkCmdBuildAccelerationStructuresKHR_(cbB, fb.count, fb.bg, fb.pr);
+                if (fb.count) vkCmdBuildAccelerationStructuresKHR_(cbB, fb.count, fb.bg, fb.pr);
                 AsBarrier(cbB, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
                 VkAccelerationStructureGeometryKHR tg = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
                 tg.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
@@ -876,7 +1055,7 @@ static void Serve(HANDLE parentProc) {
                 tb.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
                 tb.geometryCount = 1; tb.pGeometries = &tg; tb.dstAccelerationStructure = sl.tlas;
                 tb.scratchData.deviceAddress = (sl.tlasScratch.addr + 255) & ~VkDeviceAddress(255);
-                VkAccelerationStructureBuildRangeInfoKHR tr = { fb.count, 0, 0, 0 };
+                VkAccelerationStructureBuildRangeInfoKHR tr = { sl.instCount, 0, 0, 0 };
                 const VkAccelerationStructureBuildRangeInfoKHR* ptr = &tr;
                 vkCmdBuildAccelerationStructuresKHR_(cbB, 1, &tb, &ptr);
             }
@@ -895,7 +1074,7 @@ static void Serve(HANDLE parentProc) {
                 vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ab, 0, nullptr, 0, nullptr);
             }
-            vkCmdFillBuffer_(cb, counts.buf, s * 4, 4, 0);
+            vkCmdFillBuffer_(cb, counts.buf, s * 128, 128, 0);
             VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
             mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -903,19 +1082,32 @@ static void Serve(HANDLE parentProc) {
                 vkCmdBindPipeline_(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
                 vkCmdBindDescriptorSets_(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sl.ds, 0, nullptr);
                 uint32_t words = (r.width * r.height + 3) / 4, ntiles = ((r.width + 7) / 8) * ((r.height + 7) / 8);
-                for (uint32_t pass = 0; pass < (softNow ? 5u : 1u); pass++) {
+                const bool aoNow = (g.flags & SOD_GEOM_FLAG_AO) != 0;
+                const bool lampsNow = g.lampCount > 0;
+                if (lampOnly) vkCmdFillBuffer_(cb, result.buf, 0, SodLampOffset(r.width, r.height), 0xFFFFFFFFu);   // no shadows: lit
+                if (!lampsNow) vkCmdFillBuffer_(cb, result.buf, SodLampOffset(r.width, r.height), uint64_t(r.width) * r.height * 4u, 0u);
+                for (uint32_t pass = 0; pass < 8u; pass++) {
+                    if (pass >= 1 && pass <= 4 && !softNow) continue;     // soft shadows only
+                    if ((pass == 5 || pass == 6) && !aoNow) continue;     // ray-traced ambient occlusion only
+                    if (pass == 7 && !lampsNow) continue;                 // lamp lighting
+                    if (lampOnly && pass < 7) continue;                   // no shadows to trace
                     if (pass) {
                         VkMemoryBarrier cb2 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
                         cb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; cb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
                         vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &cb2, 0, nullptr, 0, nullptr);
                     }
-                    uint32_t pcv[2] = { s, pass };
-                    vkCmdPushConstants_(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pcv);
-                    uint32_t items = (pass == 1 || pass == 2) ? ntiles : pass == 3 ? r.width * r.height : words;
+                    uint32_t probe = sl.world ? ((1u << g.lightCount) - 1u) & 0x7Fu : 0u, apply = probe;
+                    for (uint32_t l = 0; l < SOD_MAX_LIGHTS; l++) if (g_encl[l].enclosed) apply &= ~(1u << l);
+                    uint32_t pcv[5] = { s, pass, sl.world ? g_world.tris : 0u, probe | (apply << 8), 0u };
+                    memcpy(&pcv[4], &g_world.litRef, 4);
+                    vkCmdPushConstants_(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, pcv);
+                    uint32_t items = (pass == 1 || pass == 2) ? ntiles : pass == 3 ? r.width * r.height
+                                   : pass == 5 ? ((r.width + 1) / 2) * ((r.height + 1) / 2) : pass == 7 ? r.width * r.height : words;
                     vkCmdDispatch_(cb, (items + 63) / 64, 1, 1);
                 }
             } else {
-                vkCmdFillBuffer_(cb, result.buf, 0, VK_WHOLE_SIZE, 0xFFFFFFFFu);   // nothing to trace: fully lit
+                vkCmdFillBuffer_(cb, result.buf, 0, SodLampOffset(r.width, r.height), 0xFFFFFFFFu);   // nothing to trace: fully lit
+                vkCmdFillBuffer_(cb, result.buf, SodLampOffset(r.width, r.height), uint64_t(r.width) * r.height * 4u, 0u);   // and no lamp light
             }
             VkMemoryBarrier hb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
             hb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT; hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;

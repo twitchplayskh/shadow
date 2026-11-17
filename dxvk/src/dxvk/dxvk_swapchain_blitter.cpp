@@ -1,4 +1,5 @@
 #include "dxvk_swapchain_blitter.h"
+#include <mutex>
 
 #include <dxvk_cursor_frag.h>
 #include <dxvk_cursor_vert.h>
@@ -14,6 +15,8 @@
 #include <smaa_blend_frag.h>
 #include <smaa_neighbor_vert.h>
 #include <smaa_neighbor_frag.h>
+#include <sod_hdr_vert.h>
+#include <sod_hdr_frag.h>
 
 #include "shaders/smaa/AreaTex.h"
 #include "shaders/smaa/SearchTex.h"
@@ -34,6 +37,26 @@ namespace dxvk {
   }
 
   void sodSetPostAA(bool enable) { g_sodPostAA.store(enable, std::memory_order_relaxed); }
+
+  // SoD HDR: settings and the glow image of the frame being presented (set from the CS thread before the present)
+  static std::mutex          g_sodHdrMutex;
+  static bool                g_sodHdrOn = false;
+  static float               g_sodHdrPaper = 200.0f, g_sodHdrPeak = 1000.0f;
+  static int                 g_sodHdrDebug = 0;
+  static float               g_sodHdrGamma = 2.1f, g_sodHdrSat = 1.0f;
+  static float               g_sodHdrHighlight = 0.6f;
+  static Rc<DxvkImageView>   g_sodHdrGlow;
+
+  void sodSetHdr(bool on, float paperNits, float peakNits, int debug, float gamma, float highlight, float saturation) {
+    std::lock_guard<std::mutex> lock(g_sodHdrMutex);
+    g_sodHdrOn = on; g_sodHdrPaper = paperNits; g_sodHdrPeak = peakNits; g_sodHdrDebug = debug;
+    g_sodHdrGamma = gamma; g_sodHdrHighlight = highlight; g_sodHdrSat = saturation;
+  }
+
+  void sodSetHdrGlow(const Rc<DxvkImageView>& glow) {
+    std::lock_guard<std::mutex> lock(g_sodHdrMutex);
+    g_sodHdrGlow = glow;
+  }
 
   bool sodPostAA() {
     int e = sodPostAAEnv();
@@ -111,6 +134,13 @@ namespace dxvk {
      && srcView->info().viewType == VK_IMAGE_VIEW_TYPE_2D)
       blitSrc = runSmaa(ctx, srcView);
 
+    // SoD: HDR output - the game image becomes scRGB (paper white, light sources lifted); the blit below then
+    // converts it to the HDR swap chain's colour space like any scRGB image
+    { bool hdr, test; { std::lock_guard<std::mutex> lock(g_sodHdrMutex); hdr = g_sodHdrOn && g_sodHdrDebug != 1; test = g_sodHdrDebug >= 3; }
+      if (((hdr && dstView->image()->info().colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) || test)
+       && blitSrc->image()->info().sampleCount == VK_SAMPLE_COUNT_1_BIT && blitSrc->info().viewType == VK_IMAGE_VIEW_TYPE_2D)
+        blitSrc = runSodHdr(ctx, blitSrc); }
+
     // If we can't do proper blending, render the HUD into a separate image
     bool composite = needsComposition(dstView);
 
@@ -157,10 +187,18 @@ namespace dxvk {
     renderInfo.colorAttachmentCount = 1;
     renderInfo.pColorAttachments = &attachmentInfo;
 
+    // SoD HDR test switch 8 (SODRT_HDRX): clear the swap image to a fixed colour instead of drawing the game
+    static const bool sodClearTest = [] { std::string e = env::getEnvVar("SODRT_HDRX"); return !e.empty() && (std::stoul(e) & 8u); }();
+    if (sodClearTest && dstView->image()->info().colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+      attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      attachmentInfo.clearValue.color = VkClearColorValue { { 0.58f, 0.0f, 0.58f, 1.0f } };
+    }
+
     ctx->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderInfo);
 
-    performDraw(ctx, dstView, dstRect,
-      blitSrc, srcRect, composite);
+    if (!(sodClearTest && dstView->image()->info().colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT))
+      performDraw(ctx, dstView, dstRect,
+        blitSrc, srcRect, composite);
 
     if (!composite) {
       if (m_hud)
@@ -752,19 +790,7 @@ namespace dxvk {
     VkExtent3D extent = srcView->mipLevelExtent(0u);
     VkFormat   format = srcView->info().format;
 
-    if (!m_smaaLayout) {
-      static const std::array<DxvkDescriptorSetLayoutBinding, 5> bindings = {{
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
-      }};
-
-      m_smaaLayout = m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        sizeof(SmaaPushConstants), bindings.size(), bindings.data());
-    }
+    ensureSmaaLayout();
 
     if (!m_smaaEdgePipe) {
       m_smaaEdgePipe = createSmaaPipeline(
@@ -820,6 +846,76 @@ namespace dxvk {
     ctx->track(m_samplerGamma);
     ctx->track(m_samplerSmaaPoint);
     return m_smaaOutSrv;
+  }
+
+
+  void DxvkSwapchainBlitter::ensureSmaaLayout() {
+    if (m_smaaLayout) return;
+    static const std::array<DxvkDescriptorSetLayoutBinding, 5> bindings = {{
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+    }};
+    m_smaaLayout = m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap,
+      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+      sizeof(SmaaPushConstants), bindings.size(), bindings.data());
+  }
+
+
+  // ---- SoD: HDR expansion. Game image (gamma 2.2) -> linear -> paper white; the glow image (the light sources the
+  // game drew, accumulated in 16-bit float) adds brightness above paper white up to the peak, with a soft roll-off.
+  // Output: scRGB (1.0 = 80 nits) in a 16-bit float image, colour space extended sRGB linear.
+  Rc<DxvkImageView> DxvkSwapchainBlitter::runSodHdr(
+    const Rc<DxvkCommandList>&        ctx,
+    const Rc<DxvkImageView>&          srcView) {
+    VkExtent3D extent = srcView->mipLevelExtent(0u);
+    ensureSmaaLayout();
+    if (!m_sodHdrPipe) {
+      m_sodHdrPipe = createSmaaPipeline(
+        util::DxvkBuiltInShaderStage(sod_hdr_vert, nullptr),
+        util::DxvkBuiltInShaderStage(sod_hdr_frag, nullptr), VK_FORMAT_R16G16B16A16_SFLOAT);
+    }
+    if (!m_smaaAreaSrv)
+      createSmaaLuts(ctx);
+    if (!m_sodHdrOut || m_sodHdrOut->info().extent != extent)
+      createSmaaTarget(VK_FORMAT_R16G16B16A16_SFLOAT, extent, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT, "SoD HDR",
+        m_sodHdrOut, m_sodHdrRtv, m_sodHdrSrv);
+
+    Rc<DxvkImageView> glow;
+    float paper, peak;
+    { std::lock_guard<std::mutex> lock(g_sodHdrMutex); glow = std::move(g_sodHdrGlow); g_sodHdrGlow = nullptr; paper = g_sodHdrPaper; peak = g_sodHdrPeak; }
+    static uint32_t s_logged = 0;
+    if (s_logged < 3 || (s_logged % 1800u) == 0u)
+      Logger::info(str::format("SoD-RT: HDR present: ", extent.width, "x", extent.height, " glow ", glow != nullptr ? "yes" : "no",
+        " src ", srcView->info().format, " cs ", uint32_t(srcView->image()->info().colorSpace), " -> ", m_sodHdrOut->info().format,
+        ", paper ", paper, " nits, peak ", peak, " nits"));
+    s_logged++;
+    bool haveGlow = glow != nullptr && glow->mipLevelExtent(0u).width == extent.width && glow->mipLevelExtent(0u).height == extent.height;
+
+    SmaaPushConstants args = { };
+    int dbg; float highlight, gamma, sat;
+    { std::lock_guard<std::mutex> lock(g_sodHdrMutex); dbg = g_sodHdrDebug; highlight = g_sodHdrHighlight; gamma = g_sodHdrGamma; sat = g_sodHdrSat; }
+    args.rtMetrics[0] = paper;
+    args.rtMetrics[1] = std::max(peak, paper);
+    args.rtMetrics[2] = dbg == 2 ? -1.0f : dbg >= 3 ? -float(dbg) : haveGlow ? 1.0f : 0.0f;   // test images / glow present
+    args.rtMetrics[3] = std::max(highlight, 0.0f);    // highlight strength (HdrHighlight / 100)
+    // this pass uses no samplers: the two sampler slots carry the decode gamma and the saturation (x 1000)
+    args.samplerLinear = uint32_t(std::clamp(gamma, 1.0f, 3.0f) * 1000.0f + 0.5f);
+    args.samplerPoint = uint32_t(std::clamp(sat, 0.0f, 3.0f) * 1000.0f + 0.5f);
+
+    const Rc<DxvkImageView>& g = haveGlow ? glow : srcView;
+    smaaPass(ctx, m_sodHdrOut, m_sodHdrRtv, m_sodHdrPipe,
+      {{ srcView, g, srcView, m_smaaAreaSrv, m_smaaSearchSrv }}, args);
+
+    ctx->track(srcView->image(), DxvkAccess::Read);
+    if (haveGlow) ctx->track(glow->image(), DxvkAccess::Read);
+    ctx->track(m_smaaArea, DxvkAccess::Read);
+    ctx->track(m_smaaSearch, DxvkAccess::Read);
+    ctx->track(m_samplerGamma);
+    ctx->track(m_samplerSmaaPoint);
+    return m_sodHdrSrv;
   }
 
 

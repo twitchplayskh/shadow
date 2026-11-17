@@ -25,6 +25,17 @@ namespace dxvk {
   void sodSetPostAA(bool enable);
   bool sodPostAA();
 
+  class DxvkImageView;
+  /**
+   * \brief SoD: HDR output (SoDFix HDR setting)
+   *
+   * Set per frame by the D3D9 front end. When on and the swap chain is HDR, the game image (after SMAA) is turned
+   * into scRGB: the game's white at \p paperNits, the light sources the front end drew into \p glow (a 16-bit
+   * float image the size of the game image; null = none) lifted towards \p peakNits.
+   */
+  void sodSetHdr(bool on, float paperNits, float peakNits, int debug = 0, float gamma = 2.1f, float highlight = 0.6f, float saturation = 1.0f);
+  void sodSetHdrGlow(const Rc<DxvkImageView>& glow);
+
   struct DxvkGammaCp {
     uint16_t r, g, b, a;
   };
@@ -255,6 +266,14 @@ namespace dxvk {
     const DxvkPipelineLayout* m_smaaLayout = nullptr;
     VkPipeline          m_smaaEdgePipe = VK_NULL_HANDLE, m_smaaBlendPipe = VK_NULL_HANDLE;
     std::unordered_map<uint32_t, VkPipeline> m_smaaNeighborPipes;
+    // SoD: HDR expansion (scRGB) after SMAA
+    Rc<DxvkImage>       m_sodHdrOut;
+    Rc<DxvkImageView>   m_sodHdrRtv, m_sodHdrSrv;
+    VkPipeline          m_sodHdrPipe = VK_NULL_HANDLE;
+    void ensureSmaaLayout();
+    Rc<DxvkImageView> runSodHdr(
+      const Rc<DxvkCommandList>&        ctx,
+      const Rc<DxvkImageView>&          srcView);
 
     const DxvkPipelineLayout* m_blitLayout = nullptr;
     const DxvkPipelineLayout* m_cursorLayout = nullptr;

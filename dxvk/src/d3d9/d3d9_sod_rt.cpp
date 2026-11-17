@@ -49,7 +49,7 @@ namespace dxvk::sod {
   int RtCapture::AmbientOcclusion() const {
     static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_AO", v, 8) ? std::atoi(v) : -1; }();
     if (env >= 0) return std::min(env, 2);
-    return m_getAo ? m_getAo() : 0;
+    return m_getAo ? std::min(m_getAo(), 2) : 0;   // 3 (RAY TRACED, 0.20 test) removed for now: HIGH
   }
 
   int RtCapture::Reflections() const {
@@ -86,6 +86,18 @@ namespace dxvk::sod {
     return m_getSmoothCam ? (m_getSmoothCam() ? 1 : 0) : 1;                // on unless SoDFix says otherwise
   }
 
+  int RtCapture::Hdr() const {
+    static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_HDR", v, 8) ? std::atoi(v) : -1; }();
+    if (env >= 0) return env ? 1 : 0;
+    return m_getHdr ? (m_getHdr() ? 1 : 0) : 0;
+  }
+
+  int RtCapture::HdrDebug() const {     // SoDFix.ini [Display] HdrDebug; SODRT_HDR_DEBUG overrides (test tools)
+    static const int env = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_HDR_DEBUG", v, 8) ? std::atoi(v) : -1; }();
+    if (env >= 0) return env;
+    return m_getHdrNits ? m_getHdrNits(2) : 0;
+  }
+
   void RtCapture::OnInit(VkPhysicalDevice adapter, const Rc<vk::InstanceFn>& vki) {
     // SoDFix (dinput8 proxy) exports the menu's RAY TRACING level
     if (HMODULE m = ::GetModuleHandleA("dinput8.dll"))
@@ -99,7 +111,14 @@ namespace dxvk::sod {
       m_getRelief = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetSurfaceDepth"));
       m_getUp = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetTextureUpscaling"));
       m_getGeom = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetImprovedGeometry"));
-      m_getSmoothCam = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetSmoothCamera")); }
+      m_getSmoothCam = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetSmoothCamera"));
+      m_getHdr = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetHdr"));
+      m_getHdrNits = reinterpret_cast<int(*)(int)>(::GetProcAddress(m, "SoDFix_GetHdrNits"));
+      m_getHdrCalib = reinterpret_cast<int(*)(int)>(::GetProcAddress(m, "SoDFix_GetHdrCalib"));
+      m_getMenuScreen = reinterpret_cast<int(*)(int)>(::GetProcAddress(m, "SoDFix_GetMenuScreen"));
+      m_getMenuText = reinterpret_cast<const char*(*)(int, int)>(::GetProcAddress(m, "SoDFix_GetMenuText"));
+      m_getMenuItem = reinterpret_cast<int(*)(int, int)>(::GetProcAddress(m, "SoDFix_GetMenuItem"));
+      m_getLamps = reinterpret_cast<int(*)()>(::GetProcAddress(m, "SoDFix_GetLampLighting")); }
     Logger::info(str::format("SoD-RT: capture layer active (milestone 1: capture/validation only), SoDFix link ",
       m_getRtLevel ? "found" : "not found"));
 

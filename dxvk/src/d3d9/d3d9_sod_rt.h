@@ -82,16 +82,35 @@ namespace dxvk {
       struct SodBridgeShared* Bridge() const { return m_bridge; }
       void* HelperProcess() const { return m_helperProcess; }
       int  RtLevel() const { return m_getRtLevel ? m_getRtLevel() : 0; }
+      int  LampLighting() const { return m_getLamps ? m_getLamps() : 0; }   // SoDFix [Display] LampLighting: 0 off, 1 on
       int  AntiAliasing() const { return m_getAa ? m_getAa() : 0; }   // SoDFix ANTI-ALIASING: 0 off, 1 SMAA
       int  TextureFiltering() const { return m_getTf ? m_getTf() : 0; }   // 0 standard, 1 trilinear, 2 anisotropic 16x
       bool HasTextureFiltering() const { return m_getTf != nullptr; }
       int  CinematicBars() const { return m_getBars ? m_getBars() : 1; }   // 1 on (game default), 0 off
-      int  AmbientOcclusion() const;                                         // 0 off, 1 low, 2 high (SODRT_AO overrides)
+      int  AmbientOcclusion() const;                                         // 0 off, 1 low, 2 high, 3 ray traced (SODRT_AO overrides)
       int  Reflections() const;                                              // 0 off, 1 low, 2 high (SODRT_SSR overrides)
       int  SurfaceDepth() const;                                             // 0 off, 1 low, 2 high (SODRT_RELIEF overrides)
       int  TextureUpscaling() const;                                         // 0 off, 1 2X, 2 3X, 3 4X (SODRT_UPSCALE=0/2/3/4)
       int  ImprovedGeometry() const;
       int  SmoothCamera() const;                                             // 0 off, 1 on (SODRT_SMOOTHCAM overrides)                                         // 0 off, 1 on (SODRT_GEOM overrides)
+      int  Hdr() const;                                                      // 0 off, 1 on (SODRT_HDR overrides)
+      float HdrPaperNits() const { return m_getHdrNits ? float(m_getHdrNits(0)) : 0.0f; }   // 0 = Windows' SDR content brightness
+      float HdrHighlight() const { return m_getHdrNits ? float(m_getHdrNits(3)) / 100.0f : 0.6f; } // SoDFix.ini HdrHighlight %
+      int   HdrVal(int which) const { return m_getHdrNits ? m_getHdrNits(which) : 0; }            // SoDFix_GetHdrNits
+      float HdrGamma() const     { int g = HdrVal(4); return g >= 100 && g <= 300 ? float(g) / 100.0f : 2.1f; }
+      float HdrSaturation() const { int v = HdrVal(5); return v >= 1 && v <= 300 ? float(v) / 100.0f : 1.0f; }
+      bool  CalibOpen() const    { return m_getHdrCalib && m_getHdrCalib(0) != 0; }                // HDR CALIBRATION screen
+      int   CalibRow() const     { return m_getHdrCalib ? m_getHdrCalib(1) : 0; }
+      // the screen drawn over the option menu: 0 none, 1 HDR CALIBRATION, 2 GRAPHIC SETTING; its row; its texts
+      int   MenuScreen() const   { return m_getMenuScreen ? m_getMenuScreen(0) : CalibOpen() ? 1 : 0; }
+      int   MenuRow() const      { return m_getMenuScreen ? m_getMenuScreen(1) : CalibRow(); }
+      int   MenuRows() const     { return m_getMenuScreen ? m_getMenuScreen(2) : 0; }
+      int   MenuPage() const     { return m_getMenuScreen ? m_getMenuScreen(3) : 3; }
+      int   MenuItem(int row, int which) const { return m_getMenuItem ? m_getMenuItem(row, which) : 0; }
+      const char* MenuText(int kind, int row) const { const char* t = m_getMenuText ? m_getMenuText(kind, row) : nullptr; return t ? t : ""; }
+      bool  MenuActive() const   { return m_getHdrCalib && m_getHdrCalib(2) != 0; }
+      float HdrPeakNits() const  { return m_getHdrNits ? float(m_getHdrNits(1)) : 1000.0f; }
+      int   HdrDebug() const;   // SoDFix.ini [Display] HdrDebug
       uint64_t Frame() const { return m_frame; }
       bool InPass()  const { return m_inPass; }
 
@@ -125,6 +144,7 @@ namespace dxvk {
       std::vector<uint8_t>   m_dumpBuf;
       void                   FinishDump();
       int                  (*m_getRtLevel)() = nullptr;
+      int                  (*m_getLamps)() = nullptr;
       int                  (*m_getAa)() = nullptr;
       int                  (*m_getTf)() = nullptr;
       int                  (*m_getBars)() = nullptr;
@@ -134,6 +154,12 @@ namespace dxvk {
       int                  (*m_getUp)() = nullptr;
       int                  (*m_getGeom)() = nullptr;
       int                  (*m_getSmoothCam)() = nullptr;
+      int                  (*m_getHdr)() = nullptr;
+      int                  (*m_getHdrNits)(int) = nullptr;
+      int                  (*m_getHdrCalib)(int) = nullptr;
+      int                  (*m_getMenuScreen)(int) = nullptr;
+      const char*          (*m_getMenuText)(int, int) = nullptr;
+      int                  (*m_getMenuItem)(int, int) = nullptr;
 
       // 64-bit hardware RT bridge (sod_rt64.exe)
       void*                  m_bridgeMap    = nullptr;   // HANDLE

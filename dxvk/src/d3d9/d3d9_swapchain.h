@@ -177,6 +177,8 @@ namespace dxvk {
     bool                      m_warnedAboutGDIFallback = false;
 
     VkColorSpaceKHR           m_colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    bool                      m_sodHdr = false, m_sodHdrWarned = false;   // HDR setting: HDR swap chain
+    float                     m_sodPaper = 0.0f;   // HDR paper white: Windows' SDR content brightness for this monitor
 
     bool                      m_latencyTracking = false;
     Rc<DxvkLatencyTracker>    m_latencyTracker = nullptr;

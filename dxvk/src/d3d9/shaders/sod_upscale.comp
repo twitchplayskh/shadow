@@ -1,5 +1,5 @@
 #version 450
-// Lebensbaum texture upscaling: every ordinary game texture is uploaded to the GPU at 2x or 4x its size.
+// Shadow texture upscaling: every ordinary game texture is uploaded to the GPU at 2x or 4x its size.
 // The game still sees (and locks) the original; only the Vulkan image is bigger. Edge-directed 2x passes in the
 // manner of super-xBR: new texels are interpolated along the local edge direction (4-tap lines, slightly sharper
 // than cubic), chosen by comparing how much the luminance varies along the two candidate directions, then clamped

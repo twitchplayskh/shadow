@@ -43,6 +43,8 @@ namespace dxvk {
     // KHR and EXT variants of this extension are completely identical
     m_hasSwapchainMaintenance1 = m_device->features().khrSwapchainMaintenance1.swapchainMaintenance1
                               || m_device->features().extSwapchainMaintenance1.swapchainMaintenance1;
+    { std::string e = env::getEnvVar("SODRT_HDRX");          // SoD HDR test switch 2: no swap chain maintenance
+      if (!e.empty() && (std::stoul(e) & 2u)) m_hasSwapchainMaintenance1 = false; }
 
     // Gamescope WSI is currently broken and doesn't properly signal
     // the present fence if presentation is queued but fails.
@@ -226,6 +228,14 @@ namespace dxvk {
 
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
+
+    { static uint32_t s_n = 0, s_bad = 0;                // SoD HDR debugging: what presentation returns
+      if (s_n < 5u || (status != VK_SUCCESS && s_bad < 20u)) {
+        Logger::info(str::format("Presenter: present ", s_n, " image ", m_imageIndex, " -> ", status,
+          " (format ", m_preferredFormat.format, ", colour space ", m_preferredFormat.colorSpace, ")"));
+        if (status != VK_SUCCESS) s_bad++;
+      }
+      s_n++; }
 
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
@@ -760,13 +770,24 @@ namespace dxvk {
       formatList.pNext = std::exchange(swapInfo.pNext, &formatList);
     }
 
-    if (presentId2Caps.presentId2Supported)
+    // SoD HDR test switches (SODRT_HDRX bits): 1 no full-screen-exclusive info, 2 no present-mode list,
+    // 4 no present id/wait 2 flags, 16 no mutable format
+    static const uint32_t sodX = [] { std::string e = env::getEnvVar("SODRT_HDRX"); return e.empty() ? 0u : uint32_t(std::stoul(e)); }();
+    if (sodX)
+      Logger::info(str::format("Presenter: SODRT_HDRX test switches ", sodX));
+
+    if ((sodX & 16u) && (swapInfo.flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)) {
+      swapInfo.flags &= ~VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+      swapInfo.pNext = formatList.pNext;
+    }
+
+    if (presentId2Caps.presentId2Supported && !(sodX & 4u))
       swapInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
 
-    if (presentWait2Caps.presentWait2Supported)
+    if (presentWait2Caps.presentWait2Supported && !(sodX & 4u))
       swapInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
 
-    if (m_device->features().extFullScreenExclusive)
+    if (m_device->features().extFullScreenExclusive && !(sodX & 1u))
       fullScreenInfo.pNext = const_cast<void*>(std::exchange(swapInfo.pNext, &fullScreenInfo));
 
     if (m_hasSwapchainMaintenance1)
@@ -873,6 +894,8 @@ namespace dxvk {
     // Set up feature support for present wait / id, and launch sync thread as necessary
     m_hasPresentId = presentId2Caps.presentId2Supported || m_device->features().khrPresentId.presentId;
     m_hasPresentWait = presentWait2Caps.presentWait2Supported || m_device->features().khrPresentWait.presentWait;
+    if (sodX & 4u)
+      m_hasPresentId = m_hasPresentWait = false;
 
     // Only support incremental present if the surface isn't transformed. Spec says
     // that present rects are defined with respect to the current surface transform,

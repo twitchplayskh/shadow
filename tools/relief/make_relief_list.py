@@ -9,7 +9,7 @@ C = [1, 5, 10, 12, 17, 24, 29, 46, 49, 102, 182, 377, 16, 89, 18, 39, 65]
 P = [72, 101, 122, 153, 353, 391, 413, 38, 143, 177, 225, 168, 207, 354, 420, 553, 554, 361, 479]
 # brick paving and stone-brick pathways
 B = [94, 103, 108, 115, 35, 44, 76, 73, 75, 227, 257, 259, 261, 550]
-out = ['# Lebensbaum surface depth (relief) materials, generated from ccc.wad by tools/relief/make_relief_list.py',
+out = ['# Shadow surface depth (relief) materials, generated from ccc.wad by tools/relief/make_relief_list.py',
        '# page <table index> <page w> <page h> <x> <y> <w> <h> <class>   region of a texture page',
        '# slot <table index> <class>                                     a sub-texture cut from a page at load',
        '# class: C cobblestone / setts, P stone paving slabs / flagstones, B brick paving']

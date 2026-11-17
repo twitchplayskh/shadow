@@ -1,4 +1,4 @@
-// Lebensbaum SMOOTH CAMERA. Some of the game's follow cameras move unevenly while the player walks at a constant
+// Shadow SMOOTH CAMERA. Some of the game's follow cameras move unevenly while the player walks at a constant
 // speed: measured per frame 60..105 world units around a mean of 80 (surge, ease off, drop back), where a straight
 // tracking camera in the same street moves a steady 76..80. The frames themselves arrive evenly; it is the camera
 // that lurches. Here the camera POSITION of each frame is evened out before anything is drawn with it: its step
@@ -12,6 +12,7 @@
 // (the shadow-volume shaders): those get the same change, so everything in the frame agrees.
 
 #include "d3d9_device.h"
+#include "d3d9_sod_prof.h"
 
 namespace dxvk {
 
@@ -103,6 +104,7 @@ namespace dxvk {
 
   // SetTransform(VIEW): returns the matrix to store
   const D3DMATRIX* D3D9DeviceEx::SodSmoothCamView(const D3DMATRIX* m) {
+    ::sod::prof::Scope pz(::sod::prof::ZSmoothCam);
     if (!m || m_sodInternal || !SodSmoothCamEnabled()) return m;
     if (!m_sodScFrameSet) SodSmoothCamBegin(*m);
     if (!m_sodScActive || std::memcmp(m, &m_sodScRaw, sizeof(D3DMATRIX))) return m;

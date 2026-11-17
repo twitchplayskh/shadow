@@ -6,6 +6,7 @@
 
 #include "d3d9_include.h"
 #include "d3d9_sod_rt.h"
+struct SodGeomLamp;
 #include "d3d9_sod_link.h"
 #include "d3d9_sod_ao.h"
 #include "d3d9_sod_ssr.h"
@@ -948,13 +949,60 @@ namespace dxvk {
       ~SodMarkGuard();
     };
     bool m_sodInternal = false;                // our own draws (shadow pass) are not observed
+    // HDR (d3d9_sod_hdr.cpp): the game's additive light draws, drawn again into a 16-bit float glow image
+    IDirect3DTexture9* m_sodGlowTex = nullptr;  // PRIVATE reference
+    UINT m_sodGlowW = 0, m_sodGlowH = 0;
+    uint64_t m_sodGlowFrame = ~0ull; uint32_t m_sodGlowDraws = 0;
+    bool m_sodGlowReady = false, m_sodGlowWarned = false;
+    bool SodGlowWanted();
+    bool SodGlowEnsure(UINT width, UINT height);
+    // HDR CALIBRATION screen (d3d9_sod_calib.cpp); textures: PRIVATE references
+    IDirect3DTexture9 *m_sodCalAtlas = nullptr, *m_sodCalPar = nullptr, *m_sodCalColor = nullptr, *m_sodCalGlow = nullptr;
+    bool m_sodCalHave = false, m_sodCalIsRT = false, m_sodCalSaved = false, m_sodCalWasOpen = false, m_sodCalTriedLoad = false;
+    uint32_t m_sodCalLit = 0;
+    void SodCalibFrame();
+    void SodCalibRelease();
+    bool SodCalibSave();
+    bool SodCalibLoad();
+    void SodGlowRedraw(uint32_t api, D3DPRIMITIVETYPE type, UINT a, UINT b, UINT c, UINT d, UINT e,
+                       const void* idata, D3DFORMAT ifmt, const void* vdata, UINT stride);
+    Rc<DxvkImageView> SodGlowView();
+    struct SodGlowScope {                      // after the game's draw: the same draw into the glow image
+      D3D9DeviceEx* d; uint32_t api; D3DPRIMITIVETYPE type; UINT a, b, c, e2, e;
+      const void* idata; D3DFORMAT ifmt; const void* vdata; UINT stride;
+      ~SodGlowScope() {
+        if (!d) return;
+        if (d->SodGlowWanted()) d->SodGlowRedraw(api, type, a, b, c, e2, e, idata, ifmt, vdata, stride);
+        d->SodFlameObserve(api, type, a, b, api == 1 ? c : e2, vdata, stride);   // LAMP LIGHTING: the game's own flames
+      }
+    };
+    // WORLD SHADOWS (d3d9_sod_world.cpp): room / street draws become occluders of the ray-traced shadows
+    void SodWorldObserve(uint32_t api, D3DPRIMITIVETYPE type, UINT primCount, INT baseVertex, UINT minIndex,
+                         UINT numVertices, UINT startIndex);
+    bool SodWorldTexSolid(IDirect3DBaseTexture9* tex, DWORD ref, DWORD func);
+    void SodWorldView(const D3DMATRIX* m);
+    uint32_t m_sodWvFrame = 0; bool m_sodWvValid = false; float m_sodWvPos[3] = { }, m_sodWvFwd[3] = { };
+    std::unordered_map<uint64_t, uint8_t> m_sodWorldTexSolid;
     IDirect3DTexture9* m_sodMaskTex = nullptr; // L8 light factor, one texel per pixel (holds a PRIVATE reference)
     void SodReleaseMaskTex();
     UINT m_sodMaskW = 0, m_sodMaskH = 0;
     void SodApplyShadowPass(const Rc<DxvkBuffer>& factors, uint32_t width, uint32_t height);
     // back buffer *= factor (1 byte per pixel, 255 = 1), optionally outside character pixels (stencil 0x80)
     void SodMultiplyPass(const Rc<DxvkBuffer>& factors, uint32_t width, uint32_t height, bool excludeCharacters,
-                         IDirect3DTexture9** tex, UINT* texW, UINT* texH, bool blendRgba = false);
+                         IDirect3DTexture9** tex, UINT* texW, UINT* texH, bool blendRgba = false, int blendMode = 0, VkDeviceSize srcOffset = 0);
+    // lamp lighting (d3d9_sod_link): frame *= 1 + lamp light, outside character pixels
+    void SodApplyLampPass(const Rc<DxvkBuffer>& result, VkDeviceSize offset, uint32_t width, uint32_t height);
+    IDirect3DTexture9* m_sodLampTex = nullptr; UINT m_sodLampW = 0, m_sodLampH = 0;
+    uint64_t m_sodLampOn[16] = { };            // frame each Direct3D light was last lit (LightEnable / SetLight)
+    // lamp registry (d3d9_sod_lamps.cpp): every lamp and flame seen lately
+    struct SodLampEntry { float pos[3], col[3], att[3], range; bool flame; uint64_t first, last; };
+    std::vector<SodLampEntry> m_sodLamps; uint32_t m_sodLampLogged = 0;
+    uint32_t m_sodFlameSurvey = 0; std::unordered_set<uint64_t> m_sodFlameKeys;
+    void SodLampNote(const float pos[3], const float col[3], const float att[3], float range, bool flame);
+    void SodLampNoteLight(const D3DLIGHT9& d);
+    void SodFlameObserve(uint32_t api, D3DPRIMITIVETYPE type, UINT a, UINT b, UINT c, const void* vdata, UINT vstride);
+    uint32_t SodLampList(::SodGeomLamp* out, uint32_t max, float strength);
+    bool SodLampsAny() const { return !m_sodLamps.empty(); }
     // screen-space reflections on the floors of SoDFix\reflect.txt (d3d9_sod_ssr.h)
     struct SodSsrDraw {
       Com<D3D9VertexBuffer> vb; UINT vbOffset = 0, stride = 0;
@@ -1112,7 +1160,7 @@ namespace dxvk {
       ~SodGeomGuard();
     };
     // CRISP TEXT: the game's text images (subtitle font, clock digits, place names) redrawn as clean white lettering
-    struct SodCrispTex { Com<IDirect3DTexture9> hi; uint64_t hash = 0; uint64_t checked = 0; uint64_t used = 0; size_t bytes = 0; int id = 0; int mode = 0; };
+    struct SodCrispTex { Com<IDirect3DTexture9> hi[4]; uint32_t pending = 0; uint64_t hash = 0; uint64_t checked = 0; uint64_t used = 0; size_t bytes = 0; int id = 0; int mode = 0; };
     std::vector<int> m_sodCrispList;
     std::unordered_map<IDirect3DBaseTexture9*, SodCrispTex> m_sodCrisp;
     std::vector<std::pair<int, IDirect3DBaseTexture9*>> m_sodCrispIds;
@@ -1120,7 +1168,10 @@ namespace dxvk {
     bool m_sodCrispTried = false;
     std::unordered_set<int> m_sodCrispLogged;
     IDirect3DTexture9* SodCrispFor(IDirect3DBaseTexture9* tex);
-    bool SodCrispBuild(IDirect3DTexture9* src, SodCrispTex& c);
+    bool SodCrispRead(IDirect3DTexture9* src, SodCrispTex& c, std::vector<float>& rgba, UINT& w, UINT& h, uint64_t& hash);
+    std::shared_ptr<const std::vector<uint8_t>> m_sodPromptShared;
+    int (__cdecl* m_sodPromptStyle)() = nullptr;
+    std::vector<uint8_t> m_sodPromptAtlas; uint32_t m_sodPromptW = 0, m_sodPromptH = 0; bool m_sodPromptTried = false;
     // subtitle backing: a faint soft dark band behind subtitle lines (text from the subtitle font low on the screen),
     // placed where the subtitle text was in the frame before
     struct SodBand { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, alpha = 0.0f; bool any = false; };
@@ -1140,6 +1191,7 @@ namespace dxvk {
       ~SodCrispScope();
     };
     std::unique_ptr<sod::SrPass> m_sodSr;
+    uint64_t m_sodSrPrevGpuUs = 0; float m_sodSrGpuBase = -1.0f; float m_sodSrShare = 0.25f; int64_t m_sodSrCredit = 0;
     bool m_sodSrTried = false;
     std::deque<SodSrJob> m_sodSrQueue;
     uint32_t m_sodSrDone = 0;

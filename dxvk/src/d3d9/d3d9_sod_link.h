@@ -65,8 +65,29 @@ namespace dxvk {
       void OnCharacter(uint64_t drawKey, uint32_t meshKey, const float* tris, size_t triCount);
       void OnCamera(const float viewProj[16], const D3DVIEWPORT9& vp);
 
+      // WORLD SHADOWS (d3d9_sod_world.cpp): the area's room / street draws, kept across frames by identity
+      // (buffers + range); stamp = their contents' write generations + world matrix. Known with the same stamp:
+      // just marked as seen. Returns false when the draw has to be (re)read and handed over with OnWorldDraw.
+      bool WorldSeen(uint64_t id, uint64_t stamp, uint32_t frame);
+      void OnWorldDraw(uint64_t id, uint64_t stamp, uint32_t frame, uintptr_t vb, uint64_t object, std::vector<float>&& tris, std::vector<uint32_t>&& cols);
+      // a buffer the game rewrites (flags, cloth): its draws go with every frame instead (true = animated)
+      bool BufferAnimated(uintptr_t key, uint32_t gen, uint32_t frame);
+      // an object drawn from stored poses (flags: every frame of the animation kept in one buffer, a different one
+      // drawn each frame): same buffers and size, more different ranges over time than it ever draws in one frame
+      bool PosesAnimated(uint64_t object, uint64_t variant, uint32_t frame);
+      void OnDynamicDraw(const std::vector<float>& tris) {
+        if (m_dynTris.size() > (size_t(4) << 20)) { m_dynTris.clear(); m_dynDraws = 0; }   // no trace for a while
+        m_dynTris.insert(m_dynTris.end(), tris.begin(), tris.end()); m_dynDraws++;
+      }
+      void NoteWorldTexture(bool solid, bool readable) { m_worldTex[solid ? 0 : 1]++; if (!readable) m_worldTex[2]++; }
+      void NoteWorldSkip(uint32_t reason) { if (reason < 4) m_worldSkips[reason]++; }
+      // the camera cut (a door, a new camera): only what is drawn from now on stays in the area's set
+      void NoteCut(uint32_t frame) { m_cutFrame = frame; m_cutPending = true; }
+
       // a darken quad was seen this frame and nothing has been traced yet
       bool WantsTrigger() const { return !m_lights.empty() && !m_triggered; }
+      // a frame without game shadows (no shadow volumes, so no trigger of their own) that still has lamps to trace
+      bool WantsLampTrigger() const { return m_lights.empty() && !m_triggered && m_haveCamera; }
 
       // trace now: copy depth, post the frame geometry, signal, flush, wait (before the current draw)
       void Trigger(D3D9Surface* depthStencil, uint32_t frame, bool verifyDump, bool apply = false);
@@ -147,6 +168,36 @@ namespace dxvk {
       uint32_t BuildGeometry(SodGeomFrame* g, uint32_t frame, uint32_t width, uint32_t height);
       uint32_t m_softWanted = 0;
       void ResetFrame();
+
+      // WORLD SHADOWS
+      struct WorldDraw { uint64_t stamp = 0; uint32_t lastFrame = 0; uintptr_t vb = 0; uint64_t object = 0; std::vector<float> tris; std::vector<uint32_t> cols; };
+      struct PoseObj { uint32_t frame = 0, now = 0, most = 0; std::vector<uint64_t> seen; bool animated = false; };
+      std::unordered_map<uint64_t, PoseObj> m_poses;
+      uint32_t              m_poseObjects = 0;
+      // area change: this frame's room draws, already known vs new (most of them new = another area)
+      uint32_t              m_areaFrame = 0, m_areaKnown = 0, m_areaNew = 0, m_areaChanges = 0;
+      uint32_t              m_cutFrame = 0, m_cuts = 0;
+      bool                  m_cutPending = false;
+      void CountAreaDraw(uint32_t frame, bool known) {
+        if (frame != m_areaFrame) { m_areaFrame = frame; m_areaKnown = m_areaNew = 0; }
+        (known ? m_areaKnown : m_areaNew)++;
+      }
+      struct BufGen { uint32_t gen = 0, changed = 0; bool animated = false; };
+      std::unordered_map<uintptr_t, BufGen> m_bufGen;
+      std::vector<float>    m_dynTris;             // animated world geometry since the last trace (world space)
+      uint32_t              m_dynDraws = 0, m_dynLogged = 0;
+      uint32_t              m_worldTex[3] = { };       // cut-out textures judged solid, see-through; of those unreadable
+      std::unordered_map<uint64_t, WorldDraw> m_world;
+      DWORD                 m_gamePid = 0;
+      HANDLE                m_worldMap = nullptr;
+      uint8_t*              m_worldView = nullptr;
+      bool                  m_worldDirty = false;
+      uint32_t              m_worldTris = 0, m_worldLastWrite = 0, m_worldWrites = 0;
+      uint32_t              m_lampsNow = 0, m_lampsLogged = ~0u;   // lamp lighting: lamps in the request being built
+      bool                  m_lampsApply = false;
+      uint32_t              m_lampsLogTimes = 0;
+      uint32_t              m_worldSkips[4] = { };      // alpha blend, alpha test, no depth write, sky-sized
+      void UpdateWorld(uint32_t frame);
       uint64_t Duplicate(HANDLE h);
       void Fail(const std::string& why);
       void WatchdogMain();

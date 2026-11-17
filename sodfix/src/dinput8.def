@@ -5,10 +5,20 @@ EXPORTS
     SoDFix_GetAntiAliasing
     SoDFix_GetTextureFiltering
     SoDFix_GetCinematicBars
+    SoDFix_GetLampLighting
     SoDFix_GetAmbientOcclusion
+    SoDFix_GetHdr
+    SoDFix_GetHdrNits
+    SoDFix_GetHdrCalib
+    SoDFix_GetMenuScreen
+    SoDFix_GetMenuText
+    SoDFix_GetMenuItem
     SoDFix_GetReflections
     SoDFix_GetTextureUpscaling
     SoDFix_GetImprovedGeometry
     SoDFix_GetSmoothCamera
     SoDFix_GetTextureTable
     SoDFix_GetPresentSite
+    SoDFix_GetPromptStyle
+    SoDFix_GetProfileCounters
+    SoDFix_GetOpenedFiles

@@ -1,6 +1,6 @@
 #pragma once
 
-// Lebensbaum texture upscaling. The game's ordinary textures (managed pool, colour formats, up to 512x512) get a
+// Shadow texture upscaling. The game's ordinary textures (managed pool, colour formats, up to 512x512) get a
 // Vulkan image 4x (up to 128) or 2x (up to 512) their size; the game keeps seeing, locking and copying the original
 // (the system-memory copy DXVK keeps for managed textures). On every upload the original texels go through an
 // edge-directed 2x upscaler on the GPU (sod_upscale.comp, once or twice) into the big image; automatic mips are

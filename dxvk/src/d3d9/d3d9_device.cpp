@@ -1,4 +1,5 @@
 #include "d3d9_device.h"
+#include "d3d9_sod_prof.h"
 #include <fstream>
 #include <sstream>
 
@@ -611,6 +612,7 @@ namespace dxvk {
           D3DPOOL             Pool,
           IDirect3DTexture9** ppTexture,
           HANDLE*             pSharedHandle) {
+    ::sod::prof::GameScope pz(::sod::prof::ZCreate);       // PROFILER
     InitReturnPtr(ppTexture);
 
     if (unlikely(ppTexture == nullptr))
@@ -841,6 +843,7 @@ namespace dxvk {
           D3DPOOL                  Pool,
           IDirect3DVertexBuffer9** ppVertexBuffer,
           HANDLE*                  pSharedHandle) {
+    ::sod::prof::GameScope pz(::sod::prof::ZCreate);       // PROFILER
     InitReturnPtr(ppVertexBuffer);
 
     if (unlikely(ppVertexBuffer == nullptr))
@@ -894,6 +897,7 @@ namespace dxvk {
           D3DPOOL                 Pool,
           IDirect3DIndexBuffer9** ppIndexBuffer,
           HANDLE*                 pSharedHandle) {
+    ::sod::prof::GameScope pz(::sod::prof::ZCreate);       // PROFILER
     InitReturnPtr(ppIndexBuffer);
 
     if (unlikely(ppIndexBuffer == nullptr))
@@ -2147,7 +2151,10 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) {
     if (State == D3DTS_VIEW) {
       D3D9DeviceLock lock = LockDevice();
-      if (!ShouldRecord()) pMatrix = SodSmoothCamView(pMatrix);           // SMOOTH CAMERA (d3d9_sod_smoothcam.cpp)
+      if (!ShouldRecord()) {
+        SodWorldView(pMatrix);                                             // WORLD SHADOWS: camera cuts reset the area
+        pMatrix = SodSmoothCamView(pMatrix);                               // SMOOTH CAMERA (d3d9_sod_smoothcam.cpp)
+      }
     }
     return SetStateTransform(GetTransformIndex(State), pMatrix);
   }
@@ -2266,6 +2273,28 @@ namespace dxvk {
     auto& light = m_state.lights[Index];
     light.isValid = true;
     light.light = *pLight;
+    if (Index < 16 && light.isEnabled) m_sodLampOn[Index] = m_sodRt.Frame();
+    if (light.isEnabled) SodLampNoteLight(*pLight);
+
+    // SoD-RT (lamp lighting, research): which lights the game gives Direct3D. Every distinct light is logged once
+    // (up to 400): type, position, direction, colour, range and falloff, so the town's lamps can be told apart
+    // from the sun and the characters' fill lights.
+    { static std::vector<D3DLIGHT9> seen; static uint32_t logged = 0;
+      if (logged < 400) {
+        bool dup = false;
+        for (const auto& l : seen) if (!std::memcmp(&l, pLight, sizeof l)) { dup = true; break; }
+        if (!dup) {
+          seen.push_back(*pLight); logged++;
+          const D3DLIGHT9& L = *pLight;
+          Logger::info(str::format("SoD-RT: light ", Index, " type ", uint32_t(L.Type),
+            " pos ", L.Position.x, " ", L.Position.y, " ", L.Position.z,
+            " dir ", L.Direction.x, " ", L.Direction.y, " ", L.Direction.z,
+            " diffuse ", L.Diffuse.r, " ", L.Diffuse.g, " ", L.Diffuse.b,
+            " ambient ", L.Ambient.r, " ", L.Ambient.g, " ", L.Ambient.b,
+            " range ", L.Range, " att ", L.Attenuation0, " ", L.Attenuation1, " ", L.Attenuation2,
+            " (frame ", m_sodRt.Frame(), ")"));
+        }
+      } }
 
     if (light.isEnabled)
       m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
@@ -2306,6 +2335,8 @@ namespace dxvk {
 
     auto& light = m_state.lights[Index];
 
+    if (Enable && Index < 16) m_sodLampOn[Index] = m_sodRt.Frame();   // SoD-RT lamp lighting: lit this frame
+    if (Enable && Index < m_state.lights.size() && m_state.lights[Index].isValid) SodLampNoteLight(m_state.lights[Index].light);
     if (light.isEnabled == bool(Enable))
       return D3D_OK;
 
@@ -3097,6 +3128,7 @@ namespace dxvk {
           UINT             StartVertex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+    SodGlowScope sodGlow = { this, 0, PrimitiveType, StartVertex, PrimitiveCount, 0, 0, 0, nullptr, D3DFMT_UNKNOWN, nullptr, 0 };   // HDR: additive light draws also go into the glow image
     SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(m_state.vertexDecl == nullptr))
@@ -3179,6 +3211,7 @@ namespace dxvk {
           UINT             StartIndex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+    SodGlowScope sodGlow = { this, 1, PrimitiveType, UINT(BaseVertexIndex), MinVertexIndex, NumVertices, StartIndex, PrimitiveCount, nullptr, D3DFMT_UNKNOWN, nullptr, 0 };   // HDR: additive light draws also go into the glow image
     SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(m_state.vertexDecl == nullptr))
@@ -3281,6 +3314,7 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+    SodGlowScope sodGlow = { this, 2, PrimitiveType, PrimitiveCount, 0, 0, 0, 0, nullptr, D3DFMT_UNKNOWN, pVertexStreamZeroData, VertexStreamZeroStride };   // HDR: additive light draws also go into the glow image
     SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(!VertexStreamZeroStride))
@@ -3361,6 +3395,7 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+    SodGlowScope sodGlow = { this, 3, PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, 0, 0, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride };   // HDR: additive light draws also go into the glow image
     SodCrispScope sodCrisp(this);                   // CRISP TEXT: redrawn subtitle / clock / place-name sheets
 
     if (unlikely(!VertexStreamZeroStride))
@@ -4434,18 +4469,20 @@ namespace dxvk {
           DWORD dwFlags) {
 
     SodFrameLogPresent(pSourceRect, pDestRect);
+    ::sod::prof::FrameEnd(this, 0);                     // PROFILER: frame boundary (d3d9_sod_prof.cpp)
 
-
+    SodCalibFrame();                                    // HDR CALIBRATION screen / preview scene capture
+    m_sodGlowReady = m_sodGlowFrame == m_sodRt.Frame() && m_sodRt.Hdr() > 0;   // HDR: this frame drew glows
+    if (m_sodGlowReady && (m_sodRt.Frame() % 600u) == 0u)
+      Logger::info(str::format("SoD-RT: HDR: ", m_sodGlowDraws, " light draws in the glow image this frame"));
     m_sodRt.OnPresent();
     SodLinkFrame();
     sodSetPostAA(m_sodRt.AntiAliasing() > 0);         // SMAA in the present blitter (dxvk_swapchain_blitter)
     m_sodBarsOff = m_sodRt.CinematicBars() == 0;
     m_sodAoSeen3D = false; m_sodAoDone = false;
-    SodSsrFrame();
-    SodReliefFrame();
+    { ::sod::prof::Scope pz(::sod::prof::ZFrameWork); SodSsrFrame(); SodReliefFrame(); }
     SodSrFrame();
-    SodGeomFrame();
-    SodCamFrame();
+    { ::sod::prof::Scope pz(::sod::prof::ZFrameWork); SodGeomFrame(); SodCamFrame(); }
     m_sodScFrameSet = false;                         // SMOOTH CAMERA: the next view matrix starts a new frame
     { int tf = m_sodRt.TextureFiltering();             // TEXTURE FILTERING changed: rebind every sampler
       if (tf != m_sodTexFilter) {
@@ -4458,6 +4495,7 @@ namespace dxvk {
       LARGE_INTEGER q1; ::QueryPerformanceCounter(&q1); d->m_sodLink->AddCpu(sod::BridgeLink::CpuPresent, uint64_t(q1.QuadPart - t0)); } };
     LARGE_INTEGER pq0; ::QueryPerformanceCounter(&pq0);
     PresentTimer presentTimer = { this, pq0.QuadPart };
+    ::sod::prof::Scope presentZone(::sod::prof::ZPresent);
 
     if (m_cursor.IsSoftwareCursor()) {
       D3D9_SOFTWARE_CURSOR* pSoftwareCursor = m_cursor.GetSoftwareCursor();
@@ -5554,6 +5592,7 @@ namespace dxvk {
 
 
   bool D3D9DeviceEx::SodUpscaleUpload(D3D9CommonTexture* pResource, UINT Subresource) {
+    ::sod::prof::Scope pz(::sod::prof::ZUpscale);
     if (!m_sodUp && !m_sodUpFailed) {
       try { m_sodUp = std::make_unique<sod::UpscalePass>(m_dxvkDevice); }
       catch (const DxvkError& e) { Logger::err(str::format("SoD-RT: texture upscaling unavailable: ", e.message())); m_sodUpFailed = true; }
@@ -5590,7 +5629,10 @@ namespace dxvk {
     if (!m_sodCache) m_sodCache = std::make_unique<sod::TexCache>();
     const uint32_t ow = ext.width * scale, oh = ext.height * scale;
     const VkDeviceSize outBytes = code <= 1u ? VkDeviceSize(ow) * oh * 4u : VkDeviceSize(ow) * oh * 2u;
-    const uint64_t key = sod::TexCache::Key(slice.mapPtr, size_t(bytes), ext.width, ext.height, code, scale, opaque);
+    // key from the texture's own copy (cached memory), not the upload buffer just written (write-combined: reading it
+    // back cost ~27 ms per 512 x 512 texture, the profiler's biggest hitches)
+    const size_t rowBytes = size_t(ext.width) * formatInfo->elementSize;
+    const uint64_t key = sod::TexCache::KeyRows(mapPtr, rowBytes, ext.height, size_t(pitch), ext.width, ext.height, code, scale, opaque);
     if (m_sodCache->Enabled()) {
       std::vector<uint8_t> data;
       if (m_sodCache->Load(key, size_t(outBytes), data)) {
@@ -5603,7 +5645,12 @@ namespace dxvk {
     }
 
     m_sodUp->Upload(this, slice.slice, align(bytes, 4), ext.width, ext.height, scale, code, opaque, image);
-    SodSrEnqueue(pResource, slice.mapPtr, bytes, code, opaque, key, outBytes);
+    if (size_t(pitch) == rowBytes) SodSrEnqueue(pResource, mapPtr, bytes, code, opaque, key, outBytes);
+    else {
+      std::vector<uint8_t> packed; packed.resize(size_t(bytes));
+      for (uint32_t r = 0; r < ext.height; r++) std::memcpy(packed.data() + size_t(r) * rowBytes, static_cast<const uint8_t*>(mapPtr) + size_t(r) * pitch, rowBytes);
+      SodSrEnqueue(pResource, packed.data(), bytes, code, opaque, key, outBytes);
+    }
     if ((m_sodUpCount % 500u) == 1u)
       Logger::info(str::format("SoD-RT: texture upscaling: ", m_sodUpCount, " uploads, ", m_sodCacheHits, " from the cache (last ",
         ext.width, "x", ext.height, " -> ", ow, "x", oh, ")"));
@@ -5645,6 +5692,7 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::SodSrFrame() {
+    ::sod::prof::Scope pz(::sod::prof::ZSuperRes);
     // finished results on their way to the disk cache
     for (auto it = m_sodSrReadbacks.begin(); it != m_sodSrReadbacks.end(); ) {
       if (m_csThread.lastSequenceNumber() >= it->seq && !it->buffer->isInUse(DxvkAccess::Write)) {
@@ -5660,10 +5708,28 @@ namespace dxvk {
     const uint32_t layers = m_sodSr->LayerCount();
     int64_t pending = 0;
     for (const auto& q : m_sodSrQueue) pending += int64_t(q.w) * q.h * (int64_t(layers) - std::max(q.layer, 0));
-    // per frame: 4X 1.5M pixel-layers, 3X 1.0M, 2X 0.6M (SODRT_SR_BUDGET overrides)
+    // per frame at most: 4X 1.5M pixel-layers, 3X 1.0M, 2X 0.6M (SODRT_SR_BUDGET overrides). The network shares the
+    // GPU with the game: the share it gets follows how long the game waits for the GPU (DXVK's counter). Above the
+    // usual wait by 4 ms the share halves, below it by 1.5 ms it grows again, so the work spreads over frames instead
+    // of stalling one (the profiler showed 200 ms GPU waits after an area loaded, when the budget was tripled).
+    // Unspent budget is kept (up to one large layer), so big textures still move on.
+    (void)pending;
     const int level = SodUpscaleLevel();
-    int64_t budget = envBudget > 0 ? envBudget : level >= 3 ? int64_t(1500000) : level == 2 ? int64_t(1000000) : int64_t(600000);
-    if (pending > 6000000) budget *= 3;
+    const int64_t maxBudget = envBudget > 0 ? envBudget : level >= 3 ? int64_t(1500000) : level == 2 ? int64_t(1000000) : int64_t(600000);
+    {
+      DxvkStatCounters c = m_dxvkDevice->getStatCounters();
+      const uint64_t us = c.getCtr(DxvkStatCounter::GpuSyncTicks);
+      const float waitMs = m_sodSrPrevGpuUs ? float(us - m_sodSrPrevGpuUs) / 1000.0f : 0.0f;
+      m_sodSrPrevGpuUs = us;
+      if (m_sodSrGpuBase < 0.0f) m_sodSrGpuBase = waitMs;
+      m_sodSrGpuBase += 0.02f * (std::min(waitMs, m_sodSrGpuBase + 2.0f) - m_sodSrGpuBase);   // the usual wait, spikes ignored
+      const float excess = waitMs - m_sodSrGpuBase;
+      if (excess > 4.0f) m_sodSrShare = std::max(0.02f, m_sodSrShare * 0.5f);
+      else if (excess < 1.5f) m_sodSrShare = std::min(1.0f, m_sodSrShare * 1.1f);
+    }
+    m_sodSrCredit = std::min<int64_t>(m_sodSrCredit + int64_t(double(maxBudget) * m_sodSrShare), std::max<int64_t>(maxBudget, 512 * 512));
+    int64_t budget = m_sodSrCredit;
+    struct CreditBack { int64_t& c; int64_t& b; ~CreditBack() { c = std::max<int64_t>(0, b); } } creditBack = { m_sodSrCredit, budget };
     while (budget > 0 && !m_sodSrQueue.empty()) {
       if (m_sodSrQueue.front().layer < 0) {                // pick the smallest waiting texture
         auto best = m_sodSrQueue.begin();
@@ -5675,6 +5741,7 @@ namespace dxvk {
       auto token = j.token.lock();
       if (!token || token->gen != j.gen) { m_sodSrQueue.pop_front(); continue; }     // texture gone or uploaded again
       const int64_t N = int64_t(j.w) * j.h;
+      if (budget < N) break;                              // not enough this frame: the credit carries over
       if (j.layer < 0) {
         D3D9BufferSlice slice = AllocStagingBuffer(align(VkDeviceSize(j.texels.size()), 4));
         std::memcpy(slice.mapPtr, j.texels.data(), j.texels.size());
@@ -5700,6 +5767,7 @@ namespace dxvk {
         m_sodSrQueue.pop_front();
       }
     }
+    if (m_sodSrQueue.empty()) budget = 0;               // nothing waiting: no credit kept for a burst later
   }
 
 
@@ -9528,6 +9596,7 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::SodLinkFrame() {
+    ::sod::prof::Scope pz(::sod::prof::ZRtLink);
     // bridge B2a: per-frame depth -> helper -> result round trip while RAY TRACING is on
     static const bool disabled = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_LINK", v, 8) && v[0] == '0'; }();
     if (disabled || !m_sodRt.BridgeReady() || m_sodRt.RtLevel() <= 0) return;
@@ -9579,6 +9648,7 @@ namespace dxvk {
   int D3D9DeviceEx::SodLinkObserveDraw(uint32_t api, D3DPRIMITIVETYPE type, UINT primCount, INT baseVertex, UINT minIndex,
                                         UINT numVertices, UINT startIndex, const void* upVerts, UINT upStride) {
     if (m_sodInternal || !SodLinkActive() || !m_state.vertexDecl) return 0;
+    ::sod::prof::Scope pz(::sod::prof::ZRtShadow);
     // while the link is healthy the ray-traced pass replaces the game's stencil shadows
     static const bool keepOriginal = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_APPLY", v, 8) && v[0] == '0'; }();
     const int skip = keepOriginal ? 0 : 1;
@@ -9668,6 +9738,10 @@ namespace dxvk {
       return skip;
     }
 
+    // WORLD SHADOWS: the prelit room / street geometry (fixed function) is an occluder for every light
+    if (api <= 1 && !m_state.vertexShader.ptr() && fvf == (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1))
+      SodWorldObserve(api, type, primCount, baseVertex, minIndex, numVertices, startIndex);
+
     // first other draw after the shadow pass + characters: the depth buffer now holds room + characters
     if (m_sodLink->WantsTrigger())
       m_sodLink->Trigger(m_state.depthStencil.ptr(), uint32_t(m_sodRt.Frame()), m_sodRt.Dumping(), !keepOriginal);
@@ -9699,6 +9773,11 @@ namespace dxvk {
   void D3D9DeviceEx::SodReleaseMaskTex() {
     if (m_sodMaskTex) static_cast<D3D9Texture2D*>(m_sodMaskTex)->ReleasePrivate();
     m_sodMaskTex = nullptr;
+    if (m_sodLampTex) static_cast<D3D9Texture2D*>(m_sodLampTex)->ReleasePrivate();
+    m_sodLampTex = nullptr; m_sodLampW = m_sodLampH = 0;
+    if (m_sodGlowTex) static_cast<D3D9Texture2D*>(m_sodGlowTex)->ReleasePrivate();   // HDR glow image (DEFAULT pool)
+    m_sodGlowTex = nullptr; m_sodGlowW = m_sodGlowH = 0; m_sodGlowReady = false;
+    SodCalibRelease();                                  // HDR CALIBRATION textures
     m_sodMaskW = m_sodMaskH = 0;
     if (m_sodAoTex) static_cast<D3D9Texture2D*>(m_sodAoTex)->ReleasePrivate();
     m_sodAoTex = nullptr;
@@ -9722,8 +9801,15 @@ namespace dxvk {
   }
 
 
+  // lamp lighting: RGBA8 lamp light at byte offset 'offset' of the result buffer -> frame *= 1 + lamp (world only:
+  // the game already lights its characters with these lamps)
+  void D3D9DeviceEx::SodApplyLampPass(const Rc<DxvkBuffer>& result, VkDeviceSize offset, uint32_t width, uint32_t height) {
+    SodMultiplyPass(result, width, height, true, &m_sodLampTex, &m_sodLampW, &m_sodLampH, true, 2, offset);
+  }
+
+
   void D3D9DeviceEx::SodMultiplyPass(const Rc<DxvkBuffer>& factors, uint32_t width, uint32_t height, bool excludeCharacters,
-                                     IDirect3DTexture9** texSlot, UINT* texW, UINT* texH, bool blendRgba) {
+                                     IDirect3DTexture9** texSlot, UINT* texW, UINT* texH, bool blendRgba, int blendMode, VkDeviceSize srcOffset) {
     // factor buffer (1 byte per pixel, 255 = 1) -> L8 texture -> backbuffer *= factor
     D3D9Surface* rt = m_state.renderTargets[0].ptr();
     if (!rt || !factors.ptr()) return;
@@ -9741,9 +9827,9 @@ namespace dxvk {
     }
     D3D9CommonTexture* ct = static_cast<D3D9Texture2D*>(*texSlot)->GetCommonTexture();
     if (!ct || ct->GetImage() == nullptr) return;
-    EmitCs([cImage = ct->GetImage(), cBuf = factors, cExt = VkExtent3D { width, height, 1u }, cRgba = blendRgba] (DxvkContext* ctx) {
+    EmitCs([cImage = ct->GetImage(), cBuf = factors, cExt = VkExtent3D { width, height, 1u }, cRgba = blendRgba, cOff = srcOffset] (DxvkContext* ctx) {
       VkImageSubresourceLayers sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
-      ctx->copyBufferToImage(cImage, sub, VkOffset3D { 0, 0, 0 }, cExt, cBuf, 0, 0, 0,
+      ctx->copyBufferToImage(cImage, sub, VkOffset3D { 0, 0, 0 }, cExt, cBuf, cOff, 0, 0,
         cRgba ? cImage->info().format : VK_FORMAT_R8_UNORM);
     });
 
@@ -9766,13 +9852,14 @@ namespace dxvk {
     SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
     const std::pair<D3DRENDERSTATETYPE, DWORD> rs[] = {
       { D3DRS_ZENABLE, D3DZB_FALSE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE },
-      { D3DRS_ALPHABLENDENABLE, TRUE }, { D3DRS_SRCBLEND, blendRgba ? D3DBLEND_SRCALPHA : D3DBLEND_ZERO },
-      { D3DRS_DESTBLEND, blendRgba ? D3DBLEND_INVSRCALPHA : D3DBLEND_SRCCOLOR },
+      { D3DRS_ALPHABLENDENABLE, TRUE },
+      { D3DRS_SRCBLEND, blendMode == 2 ? D3DBLEND_DESTCOLOR : blendRgba ? D3DBLEND_SRCALPHA : D3DBLEND_ZERO },
+      { D3DRS_DESTBLEND, blendMode == 2 ? D3DBLEND_ONE : blendRgba ? D3DBLEND_INVSRCALPHA : D3DBLEND_SRCCOLOR },
       { D3DRS_BLENDOP, D3DBLENDOP_ADD }, { D3DRS_SEPARATEALPHABLENDENABLE, FALSE }, { D3DRS_FOGENABLE, FALSE },
       { D3DRS_CULLMODE, D3DCULL_NONE }, { D3DRS_LIGHTING, FALSE }, { D3DRS_SPECULARENABLE, FALSE },
       { D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE },
       { D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_SRGBWRITEENABLE, FALSE }, { D3DRS_FILLMODE, D3DFILL_SOLID },
-      { D3DRS_STENCILENABLE, excludeCharacters ? TRUE : FALSE }, { D3DRS_STENCILFUNC, D3DCMP_EQUAL }, { D3DRS_STENCILREF, 0 },
+      { D3DRS_STENCILENABLE, (excludeCharacters || blendMode == 2) ? TRUE : FALSE }, { D3DRS_STENCILFUNC, D3DCMP_EQUAL }, { D3DRS_STENCILREF, 0 },
       { D3DRS_STENCILMASK, 0x80 }, { D3DRS_STENCILWRITEMASK, 0 }, { D3DRS_STENCILPASS, D3DSTENCILOP_KEEP },
       { D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP }, { D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP }, { D3DRS_TWOSIDEDSTENCILMODE, FALSE },
       { D3DRS_CLIPPLANEENABLE, 0 },
@@ -9790,13 +9877,22 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::SodAoObserve() {
+    if (m_sodInternal || m_sodAoDone || !m_state.vertexDecl) return;
+    ::sod::prof::Scope pz(::sod::prof::ZAoSsr);
     // ambient occlusion: the opaque 3D scene (room, characters) writes depth with the fixed-function pipeline;
     // the first see-through draw (no depth write) or 2D draw after it is where the effect is applied
     if (m_sodInternal || m_sodAoDone || !m_state.vertexDecl) return;
-    const bool wantAo = m_sodRt.AmbientOcclusion() > 0 && !m_sodAoFailed;
+    // AMBIENT OCCLUSION = RAY TRACED goes with the ray-traced shadow pass while that runs; otherwise GTAO HIGH
+    const bool rtao = m_sodRt.AmbientOcclusion() >= 3 && SodLinkActive();
+    const bool wantAo = m_sodRt.AmbientOcclusion() > 0 && !rtao && !m_sodAoFailed;
     const bool wantSsr = m_sodRt.Reflections() > 0 && !m_sodSsrFailed;
     const bool wantRelief = m_sodRt.SurfaceDepth() > 0 && !m_sodRelFailed;
-    if (!wantAo && !wantSsr && !wantRelief) return;
+    // LAMP LIGHTING in a room without game shadows: the trace is triggered here (otherwise by the shadow pass)
+    bool wantLamps = false;
+    if (m_sodLink && SodLinkActive() && m_sodRt.LampLighting() > 0 && m_sodLink->WantsLampTrigger()) {
+      wantLamps = SodLampsAny();
+    }
+    if (!wantAo && !wantSsr && !wantRelief && !wantLamps) return;
     const auto& rs = m_state.renderStates;
     const uint32_t fvf = m_state.vertexDecl->GetFVF();
     const bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
@@ -9817,6 +9913,7 @@ namespace dxvk {
     }
     if (m_sodAoSeen3D && (rhw || !rs[D3DRS_ZWRITEENABLE])) {
       m_sodAoDone = true;
+      if (wantLamps) m_sodLink->Trigger(m_state.depthStencil.ptr(), uint32_t(m_sodRt.Frame()), m_sodRt.Dumping(), true);
       if (wantRelief) SodReliefApply();                 // ground relief first: reflections and AO see the shifted detail
       if (wantSsr) SodSsrApply();                       // reflections of the lit scene first, then the contact shading
       if (wantAo) SodAoApply();
@@ -9829,6 +9926,7 @@ namespace dxvk {
     // faces under hair and folds of clothes darkened like a dirty veil (0.12.0). They still occlude the room.
     if (api != 1 || m_sodInternal || m_sodAoDone || m_sodAoFailed || !m_state.vertexDecl || m_state.vertexShader.ptr()) return false;
     if (m_sodRt.AmbientOcclusion() <= 0 || m_state.renderStates[D3DRS_STENCILENABLE]) return false;
+    if (m_sodRt.AmbientOcclusion() >= 3 && SodLinkActive()) return false;   // ray traced: the shadow pass marks them
     return m_state.vertexDecl->GetFVF() == (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1);
   }
 

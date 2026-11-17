@@ -18,6 +18,8 @@ dxvk_shaders = files([
   'shaders/smaa/smaa_blend_frag.frag',
   'shaders/smaa/smaa_neighbor_vert.vert',
   'shaders/smaa/smaa_neighbor_frag.frag',
+  'shaders/sod_hdr_vert.vert',
+  'shaders/sod_hdr_frag.frag',
 
   'hud/shaders/hud_chunk_frag_background.frag',
   'hud/shaders/hud_chunk_frag_visualize.frag',

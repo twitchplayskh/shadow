@@ -276,6 +276,20 @@ namespace dxvk::sod {
   }
 
 
+  uint64_t TexCache::KeyRows(const void* texels, size_t rowBytes, uint32_t rows, size_t pitch, uint32_t w, uint32_t h,
+                             uint32_t format, uint32_t scale, bool opaque) {
+    static constexpr uint64_t kVersion = 1;                 // as Key(): the same bytes in the same order give the same key
+    uint64_t x = 0xCBF29CE484222325ull;
+    auto mix = [&] (uint64_t v) { for (int i = 0; i < 8; i++) { x ^= (v >> (i * 8)) & 0xFF; x *= 0x100000001B3ull; } };
+    mix(kVersion); mix(w); mix(h); mix(format); mix(scale); mix(opaque ? 1 : 0);
+    for (uint32_t r = 0; r < rows; r++) {
+      const uint8_t* p = static_cast<const uint8_t*>(texels) + size_t(r) * pitch;
+      for (size_t i = 0; i < rowBytes; i++) { x ^= p[i]; x *= 0x100000001B3ull; }
+    }
+    return x;
+  }
+
+
   std::string TexCache::Path(uint64_t key) const {
     char name[32];
     std::snprintf(name, sizeof name, "\\%016llx.lbt", static_cast<unsigned long long>(key));

@@ -25,7 +25,7 @@ namespace dxvk::sod {
 
   BridgeLink::BridgeLink(D3D9DeviceEx* parent, const Rc<DxvkDevice>& device, SodBridgeShared* shared,
                          HANDLE helperProcess, DWORD gamePid)
-  : m_parent(parent), m_device(device), m_shared(shared), m_helperProcess(helperProcess) {
+  : m_parent(parent), m_device(device), m_shared(shared), m_helperProcess(helperProcess), m_gamePid(gamePid) {
     m_requestEvent = ::CreateEventA(nullptr, FALSE, FALSE, str::format(SOD_BRIDGE_REQUEST, gamePid).c_str());
     if (!m_requestEvent) { Fail("could not create the request event"); return; }
     m_geomMap = ::CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, SOD_BRIDGE_SLOTS * SOD_GEOM_SLOT_BYTES,
@@ -54,6 +54,8 @@ namespace dxvk::sod {
     if (m_requestEvent) ::CloseHandle(m_requestEvent);
     if (m_geom) ::UnmapViewOfFile(m_geom);
     if (m_geomMap) ::CloseHandle(m_geomMap);
+    if (m_worldView) ::UnmapViewOfFile(m_worldView);
+    if (m_worldMap) ::CloseHandle(m_worldMap);
   }
 
 
@@ -187,7 +189,8 @@ namespace dxvk::sod {
     }
 
     VkDeviceSize depthSize  = VkDeviceSize(width) * height * bpp;
-    VkDeviceSize resultSize = (VkDeviceSize(width) * height + 3u) & ~VkDeviceSize(3);
+    // light factors (1 byte per pixel), then the lamp light image (4 bytes per pixel, SodLampOffset)
+    VkDeviceSize resultSize = SodLampOffset(width, height) + VkDeviceSize(width) * height * 4u;
     HANDLE hd = nullptr, hr = nullptr;
     if (!CreateSharedBuffer(m_depth,  depthSize,  "SoD-RT depth",  &hd)) return false;
     if (!CreateSharedBuffer(m_result, resultSize, "SoD-RT result", &hr)) return false;
@@ -298,6 +301,26 @@ namespace dxvk::sod {
                                   return uint32_t(std::min(std::max(t, 0.0), 6.5) * 1e4 + 0.5); }();
       if (k >= 4u && tan4) g->flags |= 2u | (k << 8) | (tan4 << 16);
       m_softWanted = k >= 4u ? k : 0u; }
+    if (m_parent->m_sodRt.AmbientOcclusion() >= 3)      // AMBIENT OCCLUSION = RAY TRACED: traced with the shadows
+      g->flags |= SOD_GEOM_FLAG_AO;
+    if (m_worldTris) {                                   // WORLD SHADOWS: the area occludes the sun-type lights
+      g->flags |= SOD_GEOM_FLAG_WORLD;
+      static const bool lamps = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_WORLD_LAMPS", v, 8) && v[0] == '1'; }();
+      if (lamps) g->flags |= 8u;                         // and the lamps (SODRT_WORLD_LAMPS=1)
+    }
+    // LAMP LIGHTING: the game's point lights (candles, fires, ceiling lamps) that are lit now
+    m_lampsNow = 0;
+    if (m_parent->m_sodRt.LampLighting() > 0) {
+      static float strength = [] { char v[16] = { }; return ::GetEnvironmentVariableA("SODRT_LAMP_STRENGTH", v, sizeof v) ? float(atof(v)) : 0.8f; }();
+      // every lamp and flame seen lately (the game's light slots are reused between draws, so the ones set right
+      // now are only part of the room's lamps)
+      g->lampCount = m_parent->SodLampList(g->lamps, SOD_MAX_LAMPS, strength);
+      m_lampsNow = g->lampCount;
+      if (g->lampCount != m_lampsLogged && (m_lampsLogTimes++ < 40)) {
+        m_lampsLogged = g->lampCount;
+        Logger::info(str::format("SoD-RT: lamp lighting: ", g->lampCount, " lamp(s) (frame ", frame, ")"));
+      }
+    }
     g->vpX = float(m_viewport.X); g->vpY = float(m_viewport.Y);
     g->vpW = float(m_viewport.Width ? m_viewport.Width : width); g->vpH = float(m_viewport.Height ? m_viewport.Height : height);
     double vp[16], inv[16];
@@ -363,6 +386,24 @@ namespace dxvk::sod {
       gc.firstTri = g->triCount; gc.triCount = n; gc.lightMask = mask;
       std::memcpy(out + size_t(g->triCount) * 9, c.tris.data(), size_t(n) * 36);
       g->triCount += n;
+    }
+    // WORLD SHADOWS: the animated world geometry of this frame (flags, cloth) casts like a character, for the
+    // lights the world occludes (sun-type; lamps with SODRT_WORLD_LAMPS=1)
+    if (!m_dynTris.empty() && g->casterCount < SOD_MAX_CASTERS) {
+      static const bool lamps = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_WORLD_LAMPS", v, 8) && v[0] == '1'; }();
+      uint32_t mask = 0;
+      for (uint32_t l = 0; l < g->lightCount; l++) if (lamps || !isPoint[l]) mask |= 1u << l;
+      uint32_t n = uint32_t(m_dynTris.size() / 9);
+      if (g->triCount + n > SOD_GEOM_MAX_TRIS) n = uint32_t(SOD_GEOM_MAX_TRIS) - g->triCount;
+      if (mask && n) {
+        SodGeomCaster& gc = g->casters[g->casterCount++];
+        gc.firstTri = g->triCount; gc.triCount = n; gc.lightMask = mask;
+        std::memcpy(out + size_t(g->triCount) * 9, m_dynTris.data(), size_t(n) * 36);
+        g->triCount += n;
+      }
+      if (m_dynLogged < 5 || (m_dynLogged % 3000u) == 0)
+        Logger::info(str::format("SoD-RT: world shadows: ", n, " animated tris from ", m_dynDraws, " draws this frame (flags, cloth)"));
+      m_dynLogged++;
     }
     // per light: caster bounds along the light (lets the helper skip pixels that cannot be shadowed);
     // point lights: bounding sphere of the casters (u = centre, uMin = radius, pad = 1)
@@ -472,8 +513,11 @@ namespace dxvk::sod {
     if (value == 2u) value = 1u;
     uint32_t slot = (value >> 1) % SOD_BRIDGE_SLOTS;
     auto* g = reinterpret_cast<SodGeomFrame*>(m_geom + size_t(slot) * SOD_GEOM_SLOT_BYTES);
+    UpdateWorld(frame);
     uint32_t tris = BuildGeometry(g, frame, ext.width, ext.height);
-    if (!tris) return;                                   // no caster for any light: nothing to trace
+    m_dynTris.clear(); m_dynDraws = 0;                   // animated world geometry goes with one request
+    if (!tris && !(m_lampsNow && m_haveCamera)) return;   // nothing to trace (no casters, no lamps)
+    m_lampsApply = m_lampsNow > 0;
 
     // post the request (CPU side) before the GPU work is recorded: the helper waits on the GPU
     SodFrameRequest& r = m_shared->req[slot];
@@ -541,6 +585,7 @@ namespace dxvk::sod {
     if (apply) {
       uint64_t t0 = Qpc();
       m_parent->SodApplyShadowPass(m_result.dxvk, ext.width, ext.height);
+      if (m_lampsApply) m_parent->SodApplyLampPass(m_result.dxvk, SodLampOffset(ext.width, ext.height), ext.width, ext.height);
       AddCpu(CpuApply, Qpc() - t0);
     }
 

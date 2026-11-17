@@ -20,6 +20,21 @@
 //           hard value is kept (fine detail); result + shadowed-pixel count
 // Pixels outside active tiles are more than R tiles from any hard edge, so their cone result equals the hard
 // one: the extra work is confined to the neighbourhood of shadow edges.
+//
+// World shadows (pc.worldTris > 0): the room / street geometry is one more instance (mask 0x80, custom index 1)
+// that occludes every light in pc.worldMask, so buildings, pillars and lamp posts cast real shadows. The world's
+// lighting is baked into its vertex colours, so a world occluder only darkens a pixel by a weight: 0 where the
+// surface faces away from the light (the bake already has it dark), and less where the baked colour is already
+// dark (in the bake's own shadow). The baked colour under a pixel comes from a short ray along the view
+// direction that finds the world triangle there (binding 8: its three vertex colours).
+//
+// Ray-traced ambient occlusion (flags bit 4, AMBIENT OCCLUSION = RAY TRACED): after the shadows,
+//   pass 5: half resolution (2x2 blocks): 12 cosine-weighted rays per sample over the surface's hemisphere
+//           (radius kAoRadius), against the area and the characters; nearer hits occlude more. Stored in soft[].
+//   pass 6: full resolution: depth-aware 6x6 filter of the half-resolution samples, multiplied into
+//           the light factor, so the shadow pass applies shadows and occlusion in one go.
+// Unlike screen-space AO it sees what the camera does not: the underside of benches, tables and balconies, the
+// inside of arcades, the floor behind a pillar.
 layout(local_size_x = 64) in;
 
 layout(std430, set = 0, binding = 0) readonly  buffer Depth  { float depth[]; };
@@ -33,12 +48,15 @@ layout(std430, set = 0, binding = 3) readonly buffer Frame {
   vec4  lights[8];                 // xyz: towards the light, w: density
   uvec4 casters[64];               // x: first tri, y: tri count, z: light mask
   vec4  boxes[8 * 3];              // per light: (u, uMin), (v, uMax), (vMin, vMax, lMax, -)
+  uint  lampCount, lampPad0, lampPad1, lampPad2;
+  vec4  lamps[16 * 3];             // per lamp: (pos, range), (colour, att0), (att1, att2, strength, -)
 } f;
 layout(std430, set = 0, binding = 4) buffer Counts { uint counts[]; };
 layout(std430, set = 0, binding = 5) buffer Bits   { uint bits[]; };     // soft: hit bits, 1 byte per pixel
 layout(std430, set = 0, binding = 6) buffer Soft   { uint soft[]; };     // soft: pass 3 output, 1 uint per soft pixel
 layout(std430, set = 0, binding = 7) buffer Tiles  { uint tiles[]; };    // soft: [0, T) edge, [T, 2T) active
-layout(push_constant) uniform PC { uint slot; uint pass_; } pc;
+layout(std430, set = 0, binding = 8) readonly buffer WorldCol { uint worldCol[]; };   // 3 x ARGB per world triangle
+layout(push_constant) uniform PC { uint slot; uint pass_; uint worldTris; uint worldMask; float litRef; } pc;
 
 const float kBias = 1.0;           // world units (characters are ~1000 units tall)
 const uint  kTile = 8u;
@@ -58,17 +76,42 @@ vec3 worldPos(uint p, float d) {
   return w.xyz / w.w;
 }
 
+vec3 worldAtEarly(float px, float py, float d) {
+  vec4 h = vec4((px - f.vpX) / f.vpW * 2.0 - 1.0, 1.0 - (py - f.vpY) / f.vpH * 2.0, d, 1.0);
+  vec4 w;
+  for (int j = 0; j < 4; j++)
+    w[j] = h.x * f.invVP[j] + h.y * f.invVP[4 + j] + h.z * f.invVP[8 + j] + h.w * f.invVP[12 + j];
+  return w.xyz / w.w;
+}
+
 // point light (ceiling lamps): lights[l].xyz is the position, boxes[3l] = casters' bounding sphere, boxes[3l+2].w = 1
 bool isPoint(uint l) { return f.boxes[l * 3u + 2u].w > 0.5; }
 
+// world occluders for light l: distant (sun) lights; lamps only with flags bit 3 (their position is worked out
+// from the characters' shadows and may lie inside the ceiling, which would shadow the whole room)
+// pc.worldMask: bits 0..7 lights the world is probed for, bits 8..15 lights it darkens. A light the area blocks
+// nearly everywhere is enclosed (the game's "sun" for a shop's character shadows): the helper then leaves it out
+// of bits 8..15, and only the probe (pass 0, every 16th pixel) keeps measuring it.
+bool worldProbe(uint l) {
+  return pc.worldTris > 0u && ((pc.worldMask >> l) & 1u) != 0u && (!isPoint(l) || (f.flags & 8u) != 0u);
+}
+bool worldOn(uint l) { return worldProbe(l) && ((pc.worldMask >> (8u + l)) & 1u) != 0u; }
+// counts[] per slot (32 uints): [0] shadowed pixels, [1 + l] probe rays for light l, [9 + l] of those blocked by the area
+uint cbase() { return pc.slot * 32u; }
+
 // direction towards light l from pos, and the ray length (to the lamp, or "infinite" for a parallel light)
 vec3 lightDir(uint l, vec3 pos, out float tmax) {
-  if (isPoint(l)) { vec3 t = f.lights[l].xyz - pos; float d = length(t); tmax = max(d - 1.0, 0.5); return t / max(d, 1e-6); }
+  if (isPoint(l)) {
+    // with world occluders the last 60 units before the lamp are left out: its own fitting must not shadow it
+    vec3 t = f.lights[l].xyz - pos; float d = length(t);
+    tmax = max(d - (worldOn(l) ? 60.0 : 1.0), 0.5); return t / max(d, 1e-6);
+  }
   tmax = 100000.0; return f.lights[l].xyz;
 }
 
 // can a ray from pos towards light l, tilted by at most `spread` (tan), hit a caster of light l?
 bool mayHit(uint l, vec3 pos, float spread) {
+  if (worldOn(l)) return true;              // the world is everywhere
   if (isPoint(l)) {
     vec4 s = f.boxes[l * 3u];
     if (s.w < 0.0) return false;
@@ -95,7 +138,147 @@ bool occluded(uint l, vec3 pos, vec3 dir, float tmax) {
   return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
+// occlusion of light l along dir: 1 = a character, ww = only the world (its weight at this pixel), 0 = lit
+// tw: where world hits start counting (past the receiver's own surface, whose rebuilt position gets less precise
+// with distance)
+float occlusion(uint l, vec3 pos, vec3 dir, float tmax, float ww, float tw) {
+  if (ww <= 0.0 || !worldOn(l)) return occluded(l, pos, dir, tmax) ? 1.0 : 0.0;
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, (1u << l) | 0x80u,
+                        pos + dir * kBias, tw, dir, max(tmax, tw + 1.0));
+  rayQueryProceedEXT(rq);
+  if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return 0.0;
+  if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) != 1) return 1.0;
+  if (ww >= 1.0) return 1.0;
+  return occluded(l, pos, dir, tmax) ? 1.0 : ww;   // the world was hit first: a character further on still counts fully
+}
+
+// receiver facing (unit normal from the depth of the neighbours, 0 when unknown)
+vec3 normalAt(uint x, uint y, vec3 pos) {
+  uint xn = x + 1u < f.width ? x + 1u : x - 1u, yn = y + 1u < f.height ? y + 1u : y - 1u;
+  float dx = depth[y * f.width + xn], dy = depth[yn * f.width + x];
+  if (!(dx > 0.0 && dy > 0.0)) return vec3(0.0);
+  vec3 n = cross(worldPos(y * f.width + xn, dx) - pos, worldPos(yn * f.width + x, dy) - pos);
+  float len = length(n);
+  if (len <= 0.0) return vec3(0.0);
+  n /= len;
+  vec3 toCam = worldAtEarly(float(x) + 0.5, float(y) + 0.5, 1.0) - pos;   // the visible side faces the camera
+  return dot(n, toCam) < 0.0 ? -n : n;
+}
+
+// how much the world's baked lighting leaves for a world shadow to darken at this pixel: 1 under a fully lit
+// baked colour, falling to 0 where the bake is already dark. 1 when the pixel is not on world geometry.
+float bakedWeight(uint x, uint y, vec3 pos, float d) {
+  if (pc.worldTris == 0u) return 1.0;
+  vec3 nearP = worldAtEarly(float(x) + 0.5, float(y) + 0.5, 1.0);
+  vec3 v = pos - nearP; float vl = length(v);
+  if (vl <= 0.0) return 1.0;
+  v /= vl;
+  float reach = max(4.0, vl * 0.004);       // depth precision grows with distance
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x80u, pos - v * reach, 0.0, v, 2.0 * reach);
+  while (rayQueryProceedEXT(rq)) { }
+  if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return 1.0;
+  uint t = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+  if (t >= pc.worldTris) return 1.0;
+  vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+  vec3 w = vec3(1.0 - bc.x - bc.y, bc.x, bc.y);
+  float lum = 0.0;
+  for (uint k = 0u; k < 3u; k++) {
+    uint c = worldCol[t * 3u + k];
+    float r = float((c >> 16) & 255u), g = float((c >> 8) & 255u), b = float(c & 255u);
+    lum += w[k] * (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+  }
+  float ref = max(pc.litRef, 0.05);
+  return smoothstep(0.45 * ref, 0.85 * ref, lum);
+}
+
+// world weight for light l at this pixel: the baked weight, and nothing on surfaces turned away from the light
+float worldW(uint l, vec3 pos, vec3 nrm, float baked) {
+  if (!worldOn(l) || baked <= 0.0) return 0.0;
+  if (dot(nrm, nrm) < 0.5) return baked;
+  float tm; vec3 L = lightDir(l, pos, tm);
+  return baked * smoothstep(0.03, 0.2, dot(nrm, L));
+}
+
 uint toByte(float lit) { return uint(clamp(lit * 255.0 + 0.5, 0.0, 255.0)); }
+
+// ---- ray-traced ambient occlusion
+const float kAoRadius = 560.0;             // world units (a person is ~1000 tall: about table height)
+const float kAoStrength = 0.95;
+const uint  kAoRays = 12u;
+uint aoW() { return (f.width + 1u) / 2u; }
+uint aoH() { return (f.height + 1u) / 2u; }
+
+void passAo(uint id) {
+  if (id >= aoW() * aoH()) return;
+  uint x = min((id % aoW()) * 2u, f.width - 1u), y = min((id / aoW()) * 2u, f.height - 1u), p = y * f.width + x;
+  float d = depth[p];
+  float ao = 1.0;
+  if (d > 0.0 && d <= 1.0) {
+    vec3 pos = worldPos(p, d);
+    vec3 n = normalAt(x, y, pos);
+    float camDist = length(pos - worldAtEarly(float(x) + 0.5, float(y) + 0.5, 1.0));
+    if (dot(n, n) > 0.5 && camDist < 40000.0) {
+      vec3 a = abs(n.x) > 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+      vec3 t = normalize(cross(n, a)), b = cross(n, t);
+      float rot = 6.2831853 * fract(52.9829189 * fract(0.06711056 * float(x / 2u) + 0.00583715 * float(y / 2u)));
+      vec3 org = pos + n * (2.0 + 0.002 * camDist);
+      float occ = 0.0;
+      const uint kRays = kAoRays;
+      for (uint i = 0u; i < kRays; i++) {
+        float r = sqrt((float(i) + 0.5) / float(kRays));      // cosine-weighted: uniform disk, lifted
+        float ang = float(i) * 2.3999632 + rot;
+        vec2 dsk = r * vec2(cos(ang), sin(ang));
+        vec3 dir = normalize(t * dsk.x + b * dsk.y + n * sqrt(max(1.0 - r * r, 0.0)));
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, org, 0.5, dir, kAoRadius);
+        rayQueryProceedEXT(rq);
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+          float h = rayQueryGetIntersectionTEXT(rq, true) / kAoRadius;
+          occ += 1.0 - h * h;                                   // near surfaces occlude more
+        }
+      }
+      ao = 1.0 - kAoStrength * occ / float(kRays);
+      ao = mix(ao, 1.0, smoothstep(25000.0, 40000.0, camDist));   // fades out in the distance
+    }
+  }
+  soft[id] = floatBitsToUint(ao);
+}
+
+void passAoApply(uint word, uint n) {
+  uint packed = 0u, own = result[word], shadowed = 0u;
+  for (uint k = 0u; k < 4u; k++) {
+    uint p = word * 4u + k;
+    uint v = byteAt(own, k);
+    if (p < n) {
+      uint x = p % f.width, y = p / f.width;
+      float dc = depth[p];
+      if (dc > 0.0) {
+        float fx = (float(x) + 0.5) / 2.0 - 0.5, fy = (float(y) + 0.5) / 2.0 - 0.5;
+        int cx = int(floor(fx)), cy = int(floor(fy));
+        float sum = 0.0, wsum = 0.0;
+        for (int j = -2; j <= 3; j++)            // 6x6 half-resolution samples (12 pixels): smooth, edge-aware
+          for (int i = -2; i <= 3; i++) {
+            int sx = cx + i, sy = cy + j;
+            if (sx < 0 || sy < 0 || sx >= int(aoW()) || sy >= int(aoH())) continue;
+            uint qx = min(uint(sx) * 2u, f.width - 1u), qy = min(uint(sy) * 2u, f.height - 1u);
+            float dq = depth[qy * f.width + qx];
+            if (dq <= 0.0) continue;
+            float rel = abs(dq / dc - 1.0) * 100.0;           // reversed Z ~ 1/z: relative distance, in %
+            float ddx = float(sx) - fx, ddy = float(sy) - fy;
+            float wgt = exp(-0.3 * (ddx * ddx + ddy * ddy)) / (1.0 + rel * rel * 4.0);
+            sum += wgt * uintBitsToFloat(soft[uint(sy) * aoW() + uint(sx)]); wsum += wgt;
+          }
+        if (wsum > 1e-4) v = uint(clamp(float(v) * (sum / wsum) + 0.5, 0.0, 255.0));
+      }
+      if (v != 255u) shadowed++;
+    }
+    packed |= v << (8u * k);
+  }
+  result[word] = packed;
+  if (shadowed > 0u) atomicAdd(counts[cbase()], shadowed);
+}
 
 // ---- pass 0: one hard ray per light (+ hit bits in soft mode)
 void passHard(uint word, uint n, bool softMode) {
@@ -107,13 +290,34 @@ void passHard(uint word, uint n, bool softMode) {
       float d = depth[p];
       if (d > 0.0 && d <= 1.0) {
         vec3 pos = worldPos(p, d);
+        uint x = p % f.width, y = p / f.width;
+        vec3 nrm = pc.worldTris > 0u ? normalAt(x, y, pos) : vec3(0.0);
+        float baked = bakedWeight(x, y, pos, d);
+        vec3 org = pos + nrm * 2.0;           // off the surface: no self-hits on the world
+        float tw = 4.0 + 0.003 * length(pos - worldAtEarly(float(x) + 0.5, float(y) + 0.5, 1.0));
         float lit = 1.0;
         for (uint l = 0u; l < f.lightCount && l < 8u; l++) {
           if (!mayHit(l, pos, 0.0)) continue;
-          float tmax; vec3 dir = lightDir(l, pos, tmax);
-          if (occluded(l, pos, dir, tmax)) { lit *= 1.0 - f.lights[l].w; b |= 1u << l; }
+          float tmax; vec3 dir = lightDir(l, org, tmax);
+          float o = occlusion(l, org, dir, tmax, worldW(l, pos, nrm, baked), tw);
+          if (o > 0.0) { lit *= 1.0 - f.lights[l].w * o; b |= 1u << l; }
         }
         lit8 = toByte(lit);
+        // enclosure probe: every 16th pixel facing the light, one ray against the area alone
+        if ((x & 3u) == 0u && (y & 3u) == 0u && dot(nrm, nrm) > 0.5) {
+          for (uint l = 0u; l < f.lightCount && l < 8u; l++) {
+            if (!worldProbe(l)) continue;
+            float tmax; vec3 dir = lightDir(l, org, tmax);
+            if (dot(nrm, dir) < 0.2) continue;
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x80u,
+                                  org + dir * kBias, tw, dir, max(tmax, tw + 1.0));
+            rayQueryProceedEXT(rq);
+            atomicAdd(counts[cbase() + 1u + l], 1u);
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+              atomicAdd(counts[cbase() + 9u + l], 1u);
+          }
+        }
       }
     }
     if (lit8 != 255u && p < n) shadowed++;
@@ -122,7 +326,7 @@ void passHard(uint word, uint n, bool softMode) {
   }
   result[word] = packed;
   if (softMode) bits[word] = hb;
-  else if (shadowed > 0u) atomicAdd(counts[pc.slot], shadowed);
+  else if (shadowed > 0u && (f.flags & 16u) == 0u) atomicAdd(counts[cbase()], shadowed);   // with AO: counted in pass 6
 }
 
 // ---- pass 1: edge tiles
@@ -242,7 +446,8 @@ void passCone(uint id) {
       float sp = spreadOf(l, pos, gspread0);
       if (!mayHit(l, pos, sp)) continue;
       float tm;
-      if (isPoint(l)) { vec4 bs = f.boxes[l * 3u]; tm = length(bs.xyz - pos) + bs.w; }
+      if (worldOn(l)) tm = 3000.0;          // world occluders: no bound from the characters' box
+      else if (isPoint(l)) { vec4 bs = f.boxes[l * 3u]; tm = length(bs.xyz - pos) + bs.w; }
       else tm = max(f.boxes[l * 3u + 2u].z - dot(pos, f.lights[l].xyz), 0.0);
       vec3 Ld = isPoint(l) ? normalize(f.lights[l].xyz - pos) : f.lights[l].xyz;
       float cosI = nl > 0.0 ? abs(dot(nrm / nl, Ld)) : 0.0;
@@ -257,22 +462,29 @@ void passCone(uint id) {
     // per-pixel rotation of the sample disk (interleaved gradient noise); the filter in pass 4 removes it
     float rot = 6.2831853 * fract(52.9829189 * fract(0.06711056 * float(id % sw) + 0.00583715 * float(id / sw)));
     float lit = 1.0;
+    vec3 un = pc.worldTris > 0u ? normalAt(x, y, pos) : vec3(0.0);
+    float baked = bakedWeight(x, y, pos, d);
+    vec3 org = pos + un * 2.0;
+    float tw = 4.0 + 0.003 * length(pos - worldAtEarly(float(x) + 0.5, float(y) + 0.5, 1.0));
     for (uint l = 0u; l < f.lightCount && l < 8u; l++) {
       float spread = spreadOf(l, pos, gspread);
       if (!mayHit(l, pos, spread)) continue;
-      float tmax; vec3 L = lightDir(l, pos, tmax);
+      float tmax; vec3 L = lightDir(l, org, tmax);
+      float ww = worldW(l, pos, un, baked);
       vec3 a = abs(L.x) > 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
       vec3 u = normalize(cross(L, a)), w = cross(L, u);
-      uint hits = 0u, done = 0u;
+      uint hits = 0u, done = 0u; float occ = 0.0;
       for (uint i = 0u; i < samples; i++) {
         if (i == 4u && (hits == 0u || hits == 4u)) break;    // first 4 agree: not in the penumbra
         float r = sqrt((float(i) + 0.5) / float(samples)) * spread;
         float ang = float(i) * 2.3999632 + rot;
         vec3 dir = normalize(L + (u * cos(ang) + w * sin(ang)) * r);
-        if (occluded(l, pos, dir, tmax)) hits++;
+        float o = occlusion(l, org, dir, tmax, ww, tw);
+        if (o > 0.0) hits++;
+        occ += o;
         done++;
       }
-      lit *= 1.0 - f.lights[l].w * float(hits) / float(done);
+      lit *= 1.0 - f.lights[l].w * occ / float(done);
     }
     v = toByte(lit);
   }
@@ -317,7 +529,45 @@ void passBlur(uint word, uint n) {
     packed |= v << (8u * k);
   }
   result[word] = packed;
-  if (shadowed > 0u) atomicAdd(counts[pc.slot], shadowed);
+  if (shadowed > 0u && (f.flags & 16u) == 0u) atomicAdd(counts[cbase()], shadowed);       // with AO: counted in pass 6
+}
+
+// LAMP LIGHTING (pass 7, one thread per pixel): the game's own point lights (candles, fires, ceiling lamps) light
+// the surfaces around them, with Direct3D's falloff 1 / (a0 + a1 d + a2 d^2) and the surface's facing, blocked by
+// characters and the world (ray to the lamp). Written as an RGBA8 image (B, G, R, A bytes) after the light factors;
+// the frame is then multiplied by 1 + lamp outside character pixels (the game lights its characters itself).
+uint lampWord() { return ((((f.width * f.height + 3u) & ~3u) + 255u) & ~255u) / 4u; }
+void passLamps(uint p) {
+  if (p >= f.width * f.height) return;
+  float d = depth[p];
+  vec3 acc = vec3(0.0);
+  if (d > 0.0 && f.lampCount > 0u) {
+    uint x = p % f.width, y = p / f.width;
+    vec3 pos = worldPos(p, d);
+    vec3 nrm = normalAt(x, y, pos);
+    for (uint l = 0u; l < f.lampCount && l < 16u; l++) {
+      vec4 a = f.lamps[l * 3u], c = f.lamps[l * 3u + 1u], b = f.lamps[l * 3u + 2u];
+      vec3 ld = a.xyz - pos;
+      float dist = length(ld);
+      if (dist > a.w || dist < 1.0) continue;
+      vec3 L = ld / dist;
+      float ndl = dot(nrm, nrm) > 0.0 ? dot(nrm, L) : 0.6;
+      if (ndl <= 0.0) continue;
+      float att = 1.0 / max(c.w + b.x * dist + b.y * dist * dist, 0.25);
+      vec3 col = c.rgb * (att * ndl * b.z);
+      if (max(col.r, max(col.g, col.b)) < 0.004) continue;
+      // blocked on the way to the lamp? (the last 60 units are its own fitting)
+      uint mask = 0x7Fu | (pc.worldTris > 0u ? 0x80u : 0u);
+      rayQueryEXT rq;
+      rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, mask,
+                            pos + nrm * 2.0 + L * kBias, 0.5, L, max(dist - 60.0, 1.0));
+      rayQueryProceedEXT(rq);
+      if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) continue;
+      acc += col;
+    }
+  }
+  acc = clamp(acc, 0.0, 1.0);
+  result[lampWord() + p] = uint(acc.b * 255.0 + 0.5) | (uint(acc.g * 255.0 + 0.5) << 8) | (uint(acc.r * 255.0 + 0.5) << 16) | (255u << 24);
 }
 
 void main() {
@@ -329,4 +579,7 @@ void main() {
   else if (pc.pass_ == 2u) { if (id < ntiles) passDilate(id); }
   else if (pc.pass_ == 3u) passCone(id);
   else if (pc.pass_ == 4u) { if (id < words) passBlur(id, n); }
+  else if (pc.pass_ == 5u) passAo(id);
+  else if (pc.pass_ == 6u) { if (id < words) passAoApply(id, n); }
+  else if (pc.pass_ == 7u) passLamps(id);
 }

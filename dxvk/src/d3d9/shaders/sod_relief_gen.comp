@@ -1,5 +1,5 @@
 #version 450
-// Lebensbaum surface depth: height / normal map generation for one ground texture (or one region of a texture page).
+// Shadow surface depth: height / normal map generation for one ground texture (or one region of a texture page).
 // Runs once per texture, in 8 short passes (push constant mode), on a raw copy of the texture's top mip level.
 //
 // The maps are built at up to 4x the texture's resolution (the game's ground textures are often 32x32), from a

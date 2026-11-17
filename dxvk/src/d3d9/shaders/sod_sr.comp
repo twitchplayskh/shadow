@@ -1,5 +1,5 @@
 #version 450
-// Lebensbaum texture super-resolution: a compact Real-ESRGAN network (SRVGGNetCompact, "realesr-general-x4v3"
+// Shadow texture super-resolution: a compact Real-ESRGAN network (SRVGGNetCompact, "realesr-general-x4v3"
 // blended with its denoising variant; BSD-3-Clause, Xintao Wang) run on the GPU over each game texture after it
 // has been uploaded. 34 3x3 convolutions (3 -> 64 -> ... -> 48 channels, PReLU), pixel shuffle x4, plus the input
 // enlarged. The result is colour-corrected back to the original: every source texel keeps its own average colour

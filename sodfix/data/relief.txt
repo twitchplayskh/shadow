@@ -1,4 +1,4 @@
-# Lebensbaum surface depth (relief) materials, generated from ccc.wad by tools/relief/make_relief_list.py
+# Shadow surface depth (relief) materials, generated from ccc.wad by tools/relief/make_relief_list.py
 # page <table index> <page w> <page h> <x> <y> <w> <h> <class>   region of a texture page
 # slot <table index> <class>                                     a sub-texture cut from a page at load
 # class: C cobblestone / setts, P stone paving slabs / flagstones, B brick paving

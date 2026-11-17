@@ -49,7 +49,7 @@ for ei in sorted(ents):
                 except np.linalg.LinAlgError: continue
                 dd = np.sqrt(abs(np.linalg.det(J)))
                 if dd > 1e-4: dens[t].append(dd)
-lines = ['# Lebensbaum IMPROVED GEOMETRY: street textures laid out seamlessly in world space',
+lines = ['# Shadow IMPROVED GEOMETRY: street textures laid out seamlessly in world space',
          '# (generated from ccc.wad by tools/geometry/make_geometry_list.py: texel density measured on every floor triangle)',
          '# page <table index> <page w> <page h> <x> <y> <w> <h> <tile size in world units>',
          '# slot <table index> <tile size in world units>']

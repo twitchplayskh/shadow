@@ -6,6 +6,7 @@
 // in place of the game's for its draws (same texture coordinates; it is just bigger), with mipmaps and smooth
 // filtering. The game's sheet itself is never changed. SODRT_CRISPTEXT=0 turns it off.
 #include "d3d9_device.h"
+#include "d3d9_sod_prof.h"
 #include "d3d9_texture.h"
 #include <cmath>
 #include <cstring>
@@ -13,6 +14,11 @@
 #include <sstream>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <string>
 
 namespace dxvk {
@@ -23,6 +29,27 @@ namespace dxvk {
     // has (menus, settings, help, save screens, credits...: SoDFix\text_textures.txt) is redrawn too, by kind.
     const int kFontIds[] = { 77, 488, 978, 833 };
     bool IsFontId(int id) { for (int f : kFontIds) if (f == id) return true; return false; }
+
+    // BUTTON PROMPTS: where the menu images show the keyboard keys for confirm (the Enter arrow) and back ([Esc]),
+    // in source pixels of each sheet (found by matching the two glyphs across every text image; 819 is SoDFix's own
+    // options atlas). With a controller in use they show that controller's buttons instead (SoDFix_GetPromptStyle:
+    // 1 A / B, 2 cross / circle, 3 Nintendo A / B), drawn in the colour of the text they replace.
+    struct Prompt { int id; uint16_t sw, sh; int16_t x, y, w, h; uint8_t back; };
+    const Prompt kPrompts[] = {
+      { 819, 512, 512, 308, 147, 13, 17, 0 }, { 819, 512, 512, 392, 148, 49, 20, 1 },      // options: help lines
+      { 819, 512, 512, 202, 204, 13, 17, 0 }, { 819, 512, 512, 286, 205, 49, 20, 1 },
+      { 855, 512, 240, 290,  89, 13, 17, 0 }, { 855, 512, 240, 374,  90, 49, 20, 1 },      // extras
+      { 855, 512, 240, 238, 219, 49, 20, 1 },
+      { 899, 512, 128, 272,   3, 13, 17, 0 }, { 899, 512, 128, 356,   4, 49, 20, 1 },      // save / load
+      { 899, 512, 128, 200,  45, 13, 17, 0 }, { 899, 512, 128, 284,  46, 49, 20, 1 },
+      { 1792, 512, 112, 277, 64, 13, 15, 0 }, { 1792, 512, 112, 372, 65, 43, 18, 1 },      // how to play
+      { 1792, 512, 112, 307, 90, 43, 18, 1 },
+      { 472, 128, 128,  28,  4, 19, 10, 1 }, { 472, 128, 128,  30, 16,  9,  9, 0 },        // Skip:esc / Skip:enter
+    };
+    bool HasPrompts(int id, UINT w, UINT h) {
+      for (auto& p : kPrompts) if (p.id == id && p.sw == w && p.sh == h) return true;
+      return false;
+    }
 
     template <typename F> void ParallelRows(UINT n, F&& f) {
       const UINT t = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
@@ -39,114 +66,67 @@ namespace dxvk {
   }
 
 
-  IDirect3DTexture9* D3D9DeviceEx::SodCrispFor(IDirect3DBaseTexture9* tex) {
-    static const bool off = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_CRISPTEXT", v, 8) && v[0] == '0'; }();
-    if (off || !tex || tex->GetType() != D3DRTYPE_TEXTURE) return nullptr;
-    // which textures the listed table entries hold right now: looked up once per frame (three entries)
-    const uint64_t frame = m_sodRt.Frame();
-    if (frame != m_sodCrispFrame) {
-      m_sodCrispFrame = frame;
-      m_sodCrispIds.clear();
-      if (!m_sodCrispTried) {
-        m_sodCrispTried = true;
-        HMODULE fix = ::GetModuleHandleA("dinput8.dll"), d3d8 = ::GetModuleHandleA("d3d8.dll");
-        if (fix && !m_sodSsrGetTable) m_sodSsrGetTable = reinterpret_cast<uintptr_t(*)()>(::GetProcAddress(fix, "SoDFix_GetTextureTable"));
-        if (d3d8 && !m_sodSsrTex9) m_sodSsrTex9 = reinterpret_cast<void*(__stdcall*)(void*)>(::GetProcAddress(d3d8, "DXVK_SoD_D3D9Texture"));
-        // the text images: the menu line takes every id; a file's line (after its "# name.tbn2" comment) only its
-        // page id, the first number (the rest are image ids inside the file, not table entries)
-        for (int f : kFontIds) m_sodCrispList.push_back(f);
-        char path[MAX_PATH] = { };
-        ::GetModuleFileNameA(nullptr, path, MAX_PATH);
-        if (char* sl = std::strrchr(path, '\\')) sl[1] = 0;
-        std::ifstream tf(std::string(path) + "SoDFix\\text_textures.txt");
-        std::string line; bool fileLine = false;
-        while (std::getline(tf, line)) {
-          if (line.empty()) continue;
-          if (line[0] == '#') { fileLine = line.find(".tbn2") != std::string::npos; continue; }
-          std::istringstream ss(line); int id;
-          while (ss >> id) {
-            if (id >= -16384 && id <= 16383 && std::find(m_sodCrispList.begin(), m_sodCrispList.end(), id) == m_sodCrispList.end())
-              m_sodCrispList.push_back(id);
-            if (fileLine) break;
-          }
-        }
-        Logger::info(str::format("SoD-RT: crisp text ", (m_sodSsrGetTable && m_sodSsrTex9) ? "on" : "unavailable (no texture table)",
-          ", ", m_sodCrispList.size(), " text images"));
-      }
-      const uintptr_t table = (m_sodSsrGetTable && m_sodSsrTex9) ? m_sodSsrGetTable() : 0;
-      if (table) {
-        for (int id : m_sodCrispList) {
-          void* t8 = *reinterpret_cast<void* const*>(table + intptr_t(id) * 40 + 0x10);
-          if (!t8) continue;
-          if (void* t9 = m_sodSsrTex9(t8))
-            m_sodCrispIds.push_back({ id, static_cast<IDirect3DBaseTexture9*>(static_cast<IDirect3DTexture9*>(t9)) });
-        }
-      }
-      // redrawn sheets not used for a while give their memory back once the total passes 384 MB
-      size_t total = 0;
-      for (auto& kv : m_sodCrisp) total += kv.second.bytes;
-      while (total > (384u << 20)) {
-        auto old = m_sodCrisp.end();
-        for (auto it = m_sodCrisp.begin(); it != m_sodCrisp.end(); ++it)
-          if (it->second.used + 2u < frame && (old == m_sodCrisp.end() || it->second.used < old->second.used)) old = it;
-        if (old == m_sodCrisp.end()) break;
-        total -= old->second.bytes; m_sodCrisp.erase(old);
-      }
+  namespace {
+    // a text sheet to redraw: the game's pixels in, every mipmap level of the redrawn sheet out
+    struct CrispJob {
+      const void* dev = nullptr; IDirect3DBaseTexture9* tex = nullptr;
+      int id = 0, style = 0, mode = 0; UINT w = 0, h = 0, W = 0, H = 0; uint64_t hash = 0;
+      std::vector<float> rgba;
+      std::shared_ptr<const std::vector<uint8_t>> atlas; UINT atlasW = 0, atlasH = 0;
+      std::vector<std::vector<uint8_t>> levels;
+      bool ok = false;
+    };
+
+    bool CrispLogOnce(int key) {
+      static std::mutex m; static std::unordered_set<int> seen;
+      std::lock_guard<std::mutex> lk(m);
+      return seen.insert(key).second;
     }
-    int id = 0;
-    for (auto& p : m_sodCrispIds) if (p.second == tex) { id = p.first; break; }
-    m_sodCrispLastId = id;
-    if (!id) return nullptr;
-    SodCrispTex& c = m_sodCrisp[tex];
-    c.used = frame;
-    // redrawn when first seen and again if the game puts other pixels in the sheet (checked every 2 seconds)
-    if (!c.hi || c.id != id || frame - c.checked >= 120u) {
-      c.checked = frame; c.id = id;
-      if (!SodCrispBuild(static_cast<IDirect3DTexture9*>(tex), c)) { m_sodCrisp.erase(tex); return nullptr; }
-    }
-    return c.hi.ptr();
+
+    bool CrispCompute(CrispJob& job);
+
+    // one background thread: redraws take tens to hundreds of milliseconds (the profiler's biggest hitches when a
+    // menu opened); the game keeps showing its own sheet until the redrawn one is ready, a frame or two later
+    class CrispWorker {
+    public:
+      void Submit(std::unique_ptr<CrispJob> j) {
+        { std::lock_guard<std::mutex> lk(m_lock); m_in.push_back(std::move(j)); }
+        if (!m_started) { m_started = true; std::thread([this] { Run(); }).detach(); }
+        m_cond.notify_one();
+      }
+      std::vector<std::unique_ptr<CrispJob>> Take(const void* dev) {
+        std::vector<std::unique_ptr<CrispJob>> r;
+        std::lock_guard<std::mutex> lk(m_lock);
+        for (auto it = m_out.begin(); it != m_out.end(); ) {
+          if ((*it)->dev == dev) { r.push_back(std::move(*it)); it = m_out.erase(it); } else ++it;
+        }
+        return r;
+      }
+    private:
+      void Run() {
+        for (;;) {
+          std::unique_ptr<CrispJob> j;
+          { std::unique_lock<std::mutex> lk(m_lock);
+            m_cond.wait(lk, [this] { return !m_in.empty(); });
+            j = std::move(m_in.front()); m_in.pop_front(); }
+          j->ok = CrispCompute(*j);
+          std::vector<float>().swap(j->rgba);
+          std::lock_guard<std::mutex> lk(m_lock);
+          m_out.push_back(std::move(j));
+        }
+      }
+      std::mutex m_lock; std::condition_variable m_cond;
+      std::deque<std::unique_ptr<CrispJob>> m_in, m_out;
+      std::atomic<bool> m_started { false };
+    };
+    CrispWorker& Worker() { static CrispWorker* w = new CrispWorker(); return *w; }      // lives as long as the game
   }
 
 
-  bool D3D9DeviceEx::SodCrispBuild(IDirect3DTexture9* src, SodCrispTex& c) {
-    D3DSURFACE_DESC desc = { };
-    if (FAILED(src->GetLevelDesc(0, &desc))) return false;
-    const UINT w = desc.Width, h = desc.Height;
-    if (w < 8 || h < 8 || w > 512 || h > 512) return false;
-    if (std::min(w, h) < 8 && !IsFontId(c.id)) return false;
-    D3DLOCKED_RECT lr = { };
-    if (FAILED(src->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) return false;
-    std::vector<float> rgba(size_t(w) * h * 4);
-    bool fmtOk = true;
-    uint64_t hash = 1469598103934665603ull;
-    for (UINT y = 0; y < h && fmtOk; y++) {
-      const uint8_t* row = static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch;
-      const size_t rowBytes = (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8) ? size_t(w) * 4 : size_t(w) * 2;
-      for (size_t k = 0; k < rowBytes; k++) { hash ^= row[k]; hash *= 1099511628211ull; }
-      for (UINT x = 0; x < w; x++) {
-        float* o = &rgba[(size_t(y) * w + x) * 4];
-        switch (desc.Format) {
-          case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: {
-            const uint8_t* p = row + x * 4;
-            o[0] = p[2] / 255.0f; o[1] = p[1] / 255.0f; o[2] = p[0] / 255.0f;
-            o[3] = desc.Format == D3DFMT_X8R8G8B8 ? 1.0f : p[3] / 255.0f; break; }
-          case D3DFMT_A4R4G4B4: {
-            uint16_t v; std::memcpy(&v, row + x * 2, 2);
-            o[0] = ((v >> 8) & 15) / 15.0f; o[1] = ((v >> 4) & 15) / 15.0f; o[2] = (v & 15) / 15.0f; o[3] = (v >> 12) / 15.0f; break; }
-          case D3DFMT_A1R5G5B5: {
-            uint16_t v; std::memcpy(&v, row + x * 2, 2);
-            o[0] = ((v >> 10) & 31) / 31.0f; o[1] = ((v >> 5) & 31) / 31.0f; o[2] = (v & 31) / 31.0f; o[3] = (v >> 15) ? 1.0f : 0.0f; break; }
-          default: fmtOk = false; break;
-        }
-      }
-    }
-    src->UnlockRect(0);
-    if (!fmtOk) {
-      if (m_sodCrispLogged.insert(c.id).second)
-        Logger::warn(str::format("SoD-RT: crisp text: sheet ", c.id, " format ", uint32_t(desc.Format), " not handled"));
-      return false;
-    }
-    if (c.hi && hash == c.hash) return true;                       // unchanged
+  // the redraw itself, on the worker thread: everything it needs is in the job (the game's pixels, the prompt badges)
+  namespace { bool CrispCompute(CrispJob& job) {
+    const UINT w = job.w, h = job.h;
+    const std::vector<float>& rgba = job.rgba;
 
     // the letters' white core: bright and opaque; the dark outline and the transparent background count as nothing.
     // The colour of the core is kept (the sheets are white; a tinted letter stays tinted).
@@ -163,7 +143,7 @@ namespace dxvk {
     // labels, help pages, save screens, credits, logos; sheets with pictures or artwork) keeps its look exactly and is
     // only enlarged with sharp edges
     int mode = 1;
-    if (!IsFontId(c.id)) {
+    if (!IsFontId(job.id)) {
       size_t nCore = 0, nHalo = 0, nArt = 0, nOpaque = 0;
       std::vector<uint8_t> isCore(size_t(w) * h, 0), opaque(size_t(w) * h, 0);
       for (size_t i = 0; i < size_t(w) * h; i++) {
@@ -200,21 +180,17 @@ namespace dxvk {
       const float halo = float(nHalo) / float(std::max<size_t>(nCore, 1)), art = float(nArt) / float(size_t(w) * h);
       const float opq = float(nOpaque) / float(size_t(w) * h);
       mode = (halo > 0.8f && art < 0.02f && largest < 1500u && opq < 0.35f && nCore > 20u) ? 3 : 2;
-      if (m_sodCrispLogged.insert(c.id + 200000).second)
-        Logger::info(str::format("SoD-RT: crisp text: sheet ", c.id, " (", w, "x", h, "): ", mode == 3 ? "outlined lettering, outline dropped" : "kept style, sharp edges",
+      if (CrispLogOnce(job.id + 200000))
+        Logger::info(str::format("SoD-RT: crisp text: sheet ", job.id, " (", w, "x", h, "): ", mode == 3 ? "outlined lettering, outline dropped" : "kept job.style, sharp edges",
           " (halo ", halo, ", art ", art, ", opaque ", opq, ", largest patch ", largest, ")"));
     }
-    c.mode = mode;
+    job.mode = mode;
 
     auto at = [&] (const std::vector<float>& v, int x, int y) {
       x = std::min(std::max(x, 0), int(w) - 1); y = std::min(std::max(y, 0), int(h) - 1); return v[size_t(y) * w + x]; };
 
     const UINT K = std::min<UINT>(8u, 2048u / std::max(w, h));
     const UINT W = w * K, H = h * K;
-    IDirect3DTexture9* hi = nullptr;
-    if (FAILED(CreateTexture(W, H, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &hi, nullptr)) || !hi) return false;
-    Com<IDirect3DTexture9> hiRef = hi;
-    hi->Release();
 
     std::vector<float> a0(size_t(W) * H);
     std::vector<uint8_t> c0(size_t(W) * H * 3, 255);
@@ -260,7 +236,7 @@ namespace dxvk {
       char path[MAX_PATH] = { };
       ::GetModuleFileNameA(nullptr, path, MAX_PATH);
       if (char* sl = std::strrchr(path, '\\')) sl[1] = 0;
-      std::ifstream f(std::string(path) + "SoDFix\\crisp\\" + std::to_string(c.id) + ".a8", std::ios::binary);
+      std::ifstream f(std::string(path) + "SoDFix\\crisp\\" + std::to_string(job.id) + ".a8", std::ios::binary);
       uint32_t fw = 0, fh = 0;
       if (f && f.read(reinterpret_cast<char*>(&fw), 4) && f.read(reinterpret_cast<char*>(&fh), 4) && fw == W && fh >= H && fh <= 4096) {
         std::vector<uint8_t> buf(size_t(fw) * fh);
@@ -306,12 +282,12 @@ namespace dxvk {
                 a0[(size_t(d.y) * K + y) * W + x] = d.from == ~0u ? 0.0f : buf[(size_t(d.from) * K + y) * fw + x] / 255.0f;
             drawn = true;
           }
-          if (m_sodCrispLogged.insert(c.id + 100000).second)
+          if (CrispLogOnce(job.id + 100000))
             {
             std::string where;
             for (auto& d : drawnRows) where += " " + std::to_string(d.y) + "<-" + (d.from == ~0u ? std::string("empty") : std::to_string(d.from));
-            Logger::info(str::format("SoD-RT: crisp text: sheet ", c.id, " (", w, "x", h, ") ", drawn ? "from" : "does not match",
-              " SoDFix\\crisp\\", c.id, ".a8 (rows", where, ")"));
+            Logger::info(str::format("SoD-RT: crisp text: sheet ", job.id, " (", w, "x", h, ") ", drawn ? "from" : "does not match",
+              " SoDFix\\crisp\\", job.id, ".a8 (rows", where, ")"));
           }
         }
       }
@@ -358,11 +334,65 @@ namespace dxvk {
         for (int k = 0; k < 3; k++) c0[(size_t(Y) * W + X) * 3 + k] = uint8_t(std::lround(col[(size_t(sy0) * w + sx0) * 3 + k] * 255.0f));
       }
     });
+    // BUTTON PROMPTS: the keyboard glyph is replaced by the controller's badge (SoDFix\crisp\prompts.a8, made by
+    // tools/text/crisp_prompts.py: A, B, cross, circle), in the colour of the text it replaces, on the colour around it
+    if (job.style > 0) {
+      const UINT S = job.atlasH;
+      for (const Prompt& p : kPrompts) {
+        if (!S || p.id != job.id || p.sw != w || p.sh != h) continue;
+        // badge: Xbox / Nintendo A (confirm) and B (back), PlayStation cross and circle
+        const UINT badge = (job.style == 2 ? 2u : 0u) + p.back;
+        if ((badge + 1) * S > job.atlasW) continue;
+        // colour around the glyph (a ring just outside its box) and of the glyph itself (the pixel that stands out most)
+        float bg[4] = { }, bgN = 0, ink[4] = { 1, 1, 1, 1 }, best = -1;
+        for (int y = p.y - 1; y <= p.y + p.h; y++) for (int x = p.x - 1; x <= p.x + p.w; x++) {
+          if (x < 0 || y < 0 || x >= int(w) || y >= int(h)) continue;
+          const float* q = &rgba[(size_t(y) * w + x) * 4];
+          const bool ring = x < p.x || y < p.y || x >= p.x + p.w || y >= p.y + p.h;
+          if (ring) { for (int k = 0; k < 3; k++) bg[k] += q[k] * q[3]; bg[3] += q[3]; bgN++; }
+        }
+        if (bgN > 0) { for (int k = 0; k < 4; k++) bg[k] /= bgN; }
+        const float bgLum = bg[3] > 1e-3f ? (0.299f * bg[0] + 0.587f * bg[1] + 0.114f * bg[2]) / bg[3] : 0.0f;
+        for (int y = p.y; y < p.y + p.h; y++) for (int x = p.x; x < p.x + p.w; x++) {
+          if (x >= int(w) || y >= int(h)) continue;
+          const float* q = &rgba[(size_t(y) * w + x) * 4];
+          const float lum = 0.299f * q[0] + 0.587f * q[1] + 0.114f * q[2];
+          const float score = q[3] * (bg[3] < 0.2f ? lum : std::abs(lum - bgLum));
+          if (score > best) { best = score; ink[0] = q[0]; ink[1] = q[1]; ink[2] = q[2]; ink[3] = q[3]; }
+        }
+        if (best < 0.3f) continue;                                  // no glyph there: a different sheet
+        // badge size about the text height, the same for both prompts of a line ([Esc] is drawn taller than the
+        // Enter arrow), centred on the line's letters
+        const float D = std::min(float(p.back ? p.h : p.h + 3), float(p.back ? p.h : std::max(p.w, p.h))) * K * 0.80f;
+        const float cy = (p.y + p.h * 0.5f + (p.back ? -1.0f : 1.5f)) * K;
+        const float cx = p.back ? p.x * K + D * 0.5f + K : (p.x + p.w * 0.5f) * K;
+        for (UINT Y = UINT(p.y * K); Y < UINT((p.y + p.h) * K) && Y < H; Y++)
+          for (UINT X = UINT(p.x * K); X < UINT((p.x + p.w) * K) && X < W; X++) {
+            // coverage of the badge here (bilinear in the atlas), then glyph colour over the surrounding colour
+            const float u = (X + 0.5f - (cx - D * 0.5f)) / D * S - 0.5f, v = (Y + 0.5f - (cy - D * 0.5f)) / D * S - 0.5f;
+            float cov = 0.0f;
+            if (u > -1.0f && v > -1.0f && u < float(S) && v < float(S)) {
+              const int u0 = int(std::floor(u)), v0 = int(std::floor(v)); const float fu = u - u0, fv = v - v0;
+              auto A = [&] (int uu, int vv) { return (uu < 0 || vv < 0 || uu >= int(S) || vv >= int(S)) ? 0.0f
+                : (*job.atlas)[size_t(vv) * job.atlasW + badge * S + uu] / 255.0f; };
+              cov = (A(u0, v0) * (1 - fu) + A(u0 + 1, v0) * fu) * (1 - fv) + (A(u0, v0 + 1) * (1 - fu) + A(u0 + 1, v0 + 1) * fu) * fv;
+            }
+            const size_t i = size_t(Y) * W + X;
+            const float a = bg[3] * (1.0f - cov) + ink[3] * cov;
+            a0[i] = a;
+            for (int k = 0; k < 3; k++) {
+              const float pm = bg[k] * (1.0f - cov) + ink[k] * ink[3] * cov;
+              c0[i * 3 + k] = uint8_t(std::lround(std::min(a > 1e-4f ? pm / a : 1.0f, 1.0f) * 255.0f));
+            }
+          }
+      }
+    }
+
     // every level: colour with coverage as alpha; smaller levels average the one above (premultiplied)
     std::vector<float> pa = a0, pc(size_t(W) * H * 3);
     for (size_t i = 0; i < size_t(W) * H; i++) for (int k = 0; k < 3; k++) pc[i * 3 + k] = c0[i * 3 + k] / 255.0f * a0[i];
     UINT lw = W, lh = H;
-    const DWORD levels = hi->GetLevelCount();
+    DWORD levels = 1; for (UINT m = std::max(W, H); m > 1; m >>= 1) levels++;
     for (DWORD L = 0; L < levels; L++) {
       if (L > 0) {
         const UINT nw = std::max(lw / 2, 1u), nh = std::max(lh / 2, 1u);
@@ -377,10 +407,10 @@ namespace dxvk {
         }
         pa.swap(na); pc.swap(nc); lw = nw; lh = nh;
       }
-      D3DLOCKED_RECT d = { };
-      if (FAILED(hi->LockRect(L, &d, nullptr, 0))) return false;
+      job.levels.emplace_back(size_t(lw) * lh * 4);
+      uint8_t* dst = job.levels.back().data();
       for (UINT y = 0; y < lh; y++) {
-        uint8_t* row = static_cast<uint8_t*>(d.pBits) + size_t(y) * d.Pitch;
+        uint8_t* row = dst + size_t(y) * lw * 4;
         for (UINT x = 0; x < lw; x++) {
           const size_t i = size_t(y) * lw + x;
           const float a = pa[i];
@@ -390,13 +420,184 @@ namespace dxvk {
           row[x * 4 + 2] = uint8_t(std::lround(rgb[0] * 255.0f)); row[x * 4 + 3] = uint8_t(std::lround(std::min(a, 1.0f) * 255.0f));
         }
       }
-      hi->UnlockRect(L);
     }
-    c.hi = hiRef; c.hash = hash; c.bytes = size_t(W) * H * 4 * 4 / 3 * 2;    // texture + its system copy, with mipmaps
-    if (m_sodCrispLogged.insert(c.id).second)
-      Logger::info(str::format("SoD-RT: crisp text: sheet ", c.id, " (", w, "x", h, ") redrawn at ", W, "x", H));
+    job.W = W; job.H = H;
+    if (CrispLogOnce(job.id * 8 + job.style))
+      Logger::info(str::format("SoD-RT: crisp text: sheet ", job.id, " (", w, "x", h, ") redrawn at ", W, "x", H,
+        job.style ? str::format(" with ", job.style == 1 ? "A / B" : job.style == 2 ? "cross / circle" : "Nintendo A / B", " button prompts") : std::string()));
     return true;
   }
+  }
+
+
+  IDirect3DTexture9* D3D9DeviceEx::SodCrispFor(IDirect3DBaseTexture9* tex) {
+    static const bool off = [] { char v[8] = { }; return ::GetEnvironmentVariableA("SODRT_CRISPTEXT", v, 8) && v[0] == '0'; }();
+    if (off || !tex || tex->GetType() != D3DRTYPE_TEXTURE) return nullptr;
+    // which textures the listed table entries hold right now: looked up once per frame (three entries)
+    const uint64_t frame = m_sodRt.Frame();
+    if (frame != m_sodCrispFrame) {
+      m_sodCrispFrame = frame;
+      m_sodCrispIds.clear();
+      if (!m_sodCrispTried) {
+        m_sodCrispTried = true;
+        HMODULE fix = ::GetModuleHandleA("dinput8.dll"), d3d8 = ::GetModuleHandleA("d3d8.dll");
+        if (fix && !m_sodSsrGetTable) m_sodSsrGetTable = reinterpret_cast<uintptr_t(*)()>(::GetProcAddress(fix, "SoDFix_GetTextureTable"));
+        if (d3d8 && !m_sodSsrTex9) m_sodSsrTex9 = reinterpret_cast<void*(__stdcall*)(void*)>(::GetProcAddress(d3d8, "DXVK_SoD_D3D9Texture"));
+        // the text images: the menu line takes every id; a file's line (after its "# name.tbn2" comment) only its
+        // page id, the first number (the rest are image ids inside the file, not table entries)
+        for (int f : kFontIds) m_sodCrispList.push_back(f);
+        char path[MAX_PATH] = { };
+        ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+        if (char* sl = std::strrchr(path, '\\')) sl[1] = 0;
+        std::ifstream tf(std::string(path) + "SoDFix\\text_textures.txt");
+        std::string line; bool fileLine = false;
+        while (std::getline(tf, line)) {
+          if (line.empty()) continue;
+          if (line[0] == '#') { fileLine = line.find(".tbn2") != std::string::npos; continue; }
+          std::istringstream ss(line); int id;
+          while (ss >> id) {
+            if (id >= -16384 && id <= 16383 && std::find(m_sodCrispList.begin(), m_sodCrispList.end(), id) == m_sodCrispList.end())
+              m_sodCrispList.push_back(id);
+            if (fileLine) break;
+          }
+        }
+        Logger::info(str::format("SoD-RT: crisp text ", (m_sodSsrGetTable && m_sodSsrTex9) ? "on" : "unavailable (no texture table)",
+          ", ", m_sodCrispList.size(), " text images"));
+      }
+      const uintptr_t table = (m_sodSsrGetTable && m_sodSsrTex9) ? m_sodSsrGetTable() : 0;
+      if (table) {
+        for (int id : m_sodCrispList) {
+          void* t8 = *reinterpret_cast<void* const*>(table + intptr_t(id) * 40 + 0x10);
+          if (!t8) continue;
+          if (void* t9 = m_sodSsrTex9(t8))
+            m_sodCrispIds.push_back({ id, static_cast<IDirect3DBaseTexture9*>(static_cast<IDirect3DTexture9*>(t9)) });
+        }
+      }
+      // finished redraws: made into textures here, on the game's thread
+      for (auto& j : Worker().Take(this)) {
+        auto it = m_sodCrisp.find(j->tex);
+        if (it == m_sodCrisp.end()) continue;
+        SodCrispTex& e = it->second;
+        e.pending &= ~(1u << j->style);
+        if (!j->ok || e.hash != j->hash || e.id != j->id || j->levels.empty()) continue;
+        IDirect3DTexture9* t = nullptr;
+        if (FAILED(CreateTexture(j->W, j->H, UINT(j->levels.size()), 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, nullptr)) || !t) continue;
+        UINT lw = j->W, lh = j->H; bool ok = true;
+        for (UINT L = 0; L < j->levels.size() && ok; L++) {
+          D3DLOCKED_RECT d = { };
+          if (FAILED(t->LockRect(L, &d, nullptr, 0))) { ok = false; break; }
+          for (UINT y = 0; y < lh; y++) std::memcpy(static_cast<uint8_t*>(d.pBits) + size_t(y) * d.Pitch, j->levels[L].data() + size_t(y) * lw * 4, size_t(lw) * 4);
+          t->UnlockRect(L);
+          lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u);
+        }
+        if (ok) { e.hi[j->style] = t; e.mode = j->mode; }
+        t->Release();
+        e.bytes = 0;
+        for (auto& x : e.hi) if (x) e.bytes += size_t(j->W) * j->H * 4 * 4 / 3 * 2;
+      }
+      // redrawn sheets not used for a while give their memory back once the total passes 384 MB
+      size_t total = 0;
+      for (auto& kv : m_sodCrisp) total += kv.second.bytes;
+      while (total > (384u << 20)) {
+        auto old = m_sodCrisp.end();
+        for (auto it = m_sodCrisp.begin(); it != m_sodCrisp.end(); ++it)
+          if (it->second.used + 2u < frame && (old == m_sodCrisp.end() || it->second.used < old->second.used)) old = it;
+        if (old == m_sodCrisp.end()) break;
+        total -= old->second.bytes; m_sodCrisp.erase(old);
+      }
+    }
+    int id = 0;
+    for (auto& p : m_sodCrispIds) if (p.second == tex) { id = p.first; break; }
+    m_sodCrispLastId = id;
+    if (!id) return nullptr;
+    SodCrispTex& c = m_sodCrisp[tex];
+    c.used = frame;
+    // the prompt style (keyboard / controller kind) picks one of up to four redrawn copies of a sheet with prompts
+    if (!m_sodPromptStyle) {
+      if (HMODULE fix = ::GetModuleHandleA("dinput8.dll"))
+        m_sodPromptStyle = reinterpret_cast<int (__cdecl*)()>(::GetProcAddress(fix, "SoDFix_GetPromptStyle"));
+    }
+    int style = 0;
+    if (m_sodPromptStyle) {
+      D3DSURFACE_DESC dsc = { };
+      if (SUCCEEDED(static_cast<IDirect3DTexture9*>(tex)->GetLevelDesc(0, &dsc)) && HasPrompts(id, dsc.Width, dsc.Height))
+        style = std::min(std::max(m_sodPromptStyle(), 0), 3);
+    }
+    // redrawn when first seen and again if the game puts other pixels in the sheet (checked every 2 seconds); the
+    // redraw runs on the worker thread, the game's own sheet is used until it is ready
+    if ((!c.hi[style] && !(c.pending & (1u << style))) || c.id != id || frame - c.checked >= 120u) {
+      c.checked = frame; c.id = id;
+      ::sod::prof::Scope pz(::sod::prof::ZCrispText);
+      std::vector<float> rgba; UINT w = 0, h = 0; uint64_t hash = 0;
+      if (!SodCrispRead(static_cast<IDirect3DTexture9*>(tex), c, rgba, w, h, hash)) { m_sodCrisp.erase(tex); return nullptr; }
+      if (hash != c.hash) { for (auto& t : c.hi) t = nullptr; c.hash = hash; c.pending = 0; }
+      if (!c.hi[style] && !(c.pending & (1u << style))) {
+        if (style > 0 && !m_sodPromptTried) {                 // the prompt badges, read once here
+          m_sodPromptTried = true;
+          char path[MAX_PATH] = { };
+          ::GetModuleFileNameA(nullptr, path, MAX_PATH);
+          if (char* sl = std::strrchr(path, '\\')) sl[1] = 0;
+          std::ifstream f(std::string(path) + "SoDFix\\crisp\\prompts.a8", std::ios::binary);
+          uint32_t pw = 0, ph = 0;
+          if (f && f.read(reinterpret_cast<char*>(&pw), 4) && f.read(reinterpret_cast<char*>(&ph), 4) && pw && ph && pw <= 4096 && ph <= 1024) {
+            auto a = std::make_shared<std::vector<uint8_t>>(size_t(pw) * ph);
+            if (f.read(reinterpret_cast<char*>(a->data()), std::streamsize(a->size()))) { m_sodPromptShared = a; m_sodPromptW = pw; m_sodPromptH = ph; }
+          }
+          Logger::info(str::format("SoD-RT: crisp text: button prompts ", m_sodPromptW ? "ready" : "unavailable (SoDFix\\crisp\\prompts.a8 missing)"));
+        }
+        auto job = std::make_unique<CrispJob>();
+        job->dev = this; job->tex = tex; job->id = id; job->style = style; job->w = w; job->h = h; job->hash = hash;
+        job->rgba = std::move(rgba);
+        job->atlas = m_sodPromptShared; job->atlasW = m_sodPromptW; job->atlasH = m_sodPromptH;
+        c.pending |= 1u << style;
+        Worker().Submit(std::move(job));
+      }
+    }
+    return c.hi[style].ptr();
+  }
+
+
+  bool D3D9DeviceEx::SodCrispRead(IDirect3DTexture9* src, SodCrispTex& c, std::vector<float>& rgba, UINT& w, UINT& h, uint64_t& hash) {
+    D3DSURFACE_DESC desc = { };
+    if (FAILED(src->GetLevelDesc(0, &desc))) return false;
+    w = desc.Width; h = desc.Height;
+    if (w < 8 || h < 8 || w > 512 || h > 512) return false;
+    if (std::min(w, h) < 8 && !IsFontId(c.id)) return false;
+    D3DLOCKED_RECT lr = { };
+    if (FAILED(src->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) return false;
+    rgba.assign(size_t(w) * h * 4, 0.0f);
+    bool fmtOk = true;
+    hash = 1469598103934665603ull;
+    for (UINT y = 0; y < h && fmtOk; y++) {
+      const uint8_t* row = static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch;
+      const size_t rowBytes = (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8) ? size_t(w) * 4 : size_t(w) * 2;
+      for (size_t k = 0; k < rowBytes; k++) { hash ^= row[k]; hash *= 1099511628211ull; }
+      for (UINT x = 0; x < w; x++) {
+        float* o = &rgba[(size_t(y) * w + x) * 4];
+        switch (desc.Format) {
+          case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: {
+            const uint8_t* p = row + x * 4;
+            o[0] = p[2] / 255.0f; o[1] = p[1] / 255.0f; o[2] = p[0] / 255.0f;
+            o[3] = desc.Format == D3DFMT_X8R8G8B8 ? 1.0f : p[3] / 255.0f; break; }
+          case D3DFMT_A4R4G4B4: {
+            uint16_t v; std::memcpy(&v, row + x * 2, 2);
+            o[0] = ((v >> 8) & 15) / 15.0f; o[1] = ((v >> 4) & 15) / 15.0f; o[2] = (v & 15) / 15.0f; o[3] = (v >> 12) / 15.0f; break; }
+          case D3DFMT_A1R5G5B5: {
+            uint16_t v; std::memcpy(&v, row + x * 2, 2);
+            o[0] = ((v >> 10) & 31) / 31.0f; o[1] = ((v >> 5) & 31) / 31.0f; o[2] = (v & 31) / 31.0f; o[3] = (v >> 15) ? 1.0f : 0.0f; break; }
+          default: fmtOk = false; break;
+        }
+      }
+    }
+    src->UnlockRect(0);
+    if (!fmtOk) {
+      if (CrispLogOnce(c.id))
+        Logger::warn(str::format("SoD-RT: crisp text: sheet ", c.id, " format ", uint32_t(desc.Format), " not handled"));
+      return false;
+    }
+    return true;
+  }
+
 
 
   D3D9DeviceEx::SodCrispScope::SodCrispScope(D3D9DeviceEx* d) {

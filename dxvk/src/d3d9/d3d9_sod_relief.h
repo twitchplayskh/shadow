@@ -1,6 +1,6 @@
 #pragma once
 
-// Lebensbaum surface depth: parallax occlusion mapping on the ground textures of SoDFix\relief.txt (cobblestones,
+// Shadow surface depth: parallax occlusion mapping on the ground textures of SoDFix\relief.txt (cobblestones,
 // paving slabs, brick paving; generated from ccc.wad by tools/relief/make_relief_list.py).
 //
 // The game draws its rooms with the fixed-function pipeline, so the effect is applied in screen space, like the

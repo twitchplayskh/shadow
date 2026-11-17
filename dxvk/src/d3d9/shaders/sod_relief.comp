@@ -1,5 +1,5 @@
 #version 450
-// Lebensbaum surface depth: parallax occlusion mapping on the ground textures of SoDFix\relief.txt, applied in screen
+// Shadow surface depth: parallax occlusion mapping on the ground textures of SoDFix\relief.txt, applied in screen
 // space after the opaque scene (the game draws with the fixed-function pipeline, so its shaders can't be changed).
 //
 // Inputs: float copy of the game's depth (reversed: d = P10 + P14 / z), the frame so far (B8G8R8A8), and the UV / id

@@ -13,7 +13,7 @@ CHUNK_TEXT = ['fonte_all', 'fontu_all', '2141', '2256', 'book', 'ccs_font', 'com
               'ending_fi', 'ending_fs', 'ending_pc', 'nowloading', 'op_staff_roll', 'pause0', 'placename', 'timefont',
               'vmapt', 'vmapw']
 game, out = sys.argv[1], sys.argv[2]
-lines = ['# Lebensbaum: game textures that hold text (texture table indices). They are enlarged plainly (bilinear) instead',
+lines = ['# Shadow: game textures that hold text (texture table indices). They are enlarged plainly (bilinear) instead',
          '# of through the upscaler and the super-resolution network, which distort lettering.',
          '# menus, help, save, credits, pause, title (image ids)', ' '.join(map(str, MENU_TEXT))]
 for name in CHUNK_TEXT:

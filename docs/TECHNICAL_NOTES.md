@@ -431,32 +431,22 @@ Next: B2 = shared images (depth in, shadow mask out) + timeline semaphore handsh
   replaced by "add esp,16; xor eax,eax". Topmost only while focused in both screen modes; the DirectInput
   keyboard state is cleared while the game window is not in the foreground.
 
-# 0.19.0: CRISP TEXT, town walls
-- Text sheets (d3d9_sod_crisp.cpp): the game's texture table (SoDFix_GetTextureTable, 40-byte entries, D3D8 texture
-  at +0x10 -> DXVK_SoD_D3D9Texture) is read once per frame for the listed ids: 77 (fonte_all / fontu_all), 488
-  (timefont), 978 (placename), 833 (ccs_font) and every id of `text_textures.txt` (menu line: all; a file's line:
-  only its page id, the first number). In DrawPrimitive / DrawIndexedPrimitive / DrawPrimitiveUP /
-  DrawIndexedPrimitiveUP, a draw whose stage 0 holds one of them gets the redrawn sheet instead (MANAGED A8R8G8B8,
-  full mip chain, LINEAR/LINEAR/LINEAR, MAXMIPLEVEL 0) and the game's texture back afterwards. Built on first use
-  (K = min(8, 2048 / largest side)), re-read every 120 frames and rebuilt only if the pixels changed; sheets not
-  used for a while are released once the total passes 384 MB.
-- Kinds: the four font ids: letter core = alpha x smoothstep((luminance - 0.30) / 0.45) (dark outline -> 0);
-  `SoDFix\crisp\<id>.a8` (u32 width, u32 height, coverage bytes, whole page at 8x) used where it matches,
-  matched in 64-row bands by correlation with the core (> 0.6), so fontu_all's 128x128 texture (main letters only)
-  takes rows 128..255 of the 128x256 page; otherwise the core is smoothed (gaussian 0.5), Catmull-Rom enlarged and
-  cut at 0.48 with a one-texel edge from the local slope. Other sheets: halo = dark pixels (alpha > 0.3,
-  luminance < 0.3) within 2 px of a white core pixel / core count; outlined lettering if halo > 0.8, coloured
-  opaque art < 2%, largest opaque 4-connected patch < 1500 px, opaque < 35% -> core with the letters' own colour,
-  sharp enlargement; else the whole sheet, premultiplied, sharp enlargement (per channel Catmull-Rom, then
-  lo + (hi - lo) * S(S(t)) over the 2x2 source neighbourhood where hi - lo > 0.02). Decision logged once per sheet.
-- The subtitle font in game is fontu_all (128x128, main set only). The game spaces letters from its own width
-  table; the redrawn letters keep each original letter's left edge and baseline (Inter Medium at the sheet's cap
-  height of 11 px, 0.95 horizontal, narrowed if wider than the original, descenders kept inside the 14-row cell).
-- Subtitle band: quads (XYZRHW | DIFFUSE | TEX1) of sheet 77 with every vertex below 60% of the viewport are
-  collected per frame; at the first such draw of the next frame a 128x32 soft rectangle (smoothstep 22% / 45% edges)
-  is drawn under them, line height x 0.9 / x 0.45 padding, alpha 0.42 x the text's own vertex alpha, through
-  DrawIndexedPrimitiveUP inside a D3DSBT_ALL state block (Capture / Apply).
-- Walls: the survey (`wall survey` warnings) showed the town's buildings on pages 4401..4443 and 885, none listed;
-  106 wall images added from them (243 in total). The 32-group limit per draw is gone (any number of wall faces).
-  Tried and reverted: keeping only images whose edges meet when repeated (it put most town walls back to the
-  game's look) and merging facings within 6 degrees.
+## 0.23.0 (in progress): redesigned GRAPHIC SETTING screen, HDR CALIBRATION
+- Option menu state obj+0x2C (switch @0x71672D, table 0x71695C): 3 list slides in, 4 option list (obj+0x30 =
+  highlighted entry, also the page id), 5 list slides out, 6 page slides in, 7 inside a page (0x716FA0 input),
+  8 page slides out, 9-11 leaving the menu. Slide waits poll sprite 1 (cursor bar) flags bit 3 (0x717350);
+  0x716990 places the bar from the row label's y. Every state reaches the draw hook @0x716930.
+- Mouse: WM_MOUSEMOVE -> 0xF68F80/84, buttons 0xF68F98/9C (0x7B1Bxx); per frame 0x7AE310 (called @0x7AF417,
+  0x7AE512, after the keyboard) -> pos 0xF62568/0xF62688, buttons 0xF63B98/0xF63B9C, wheel 0xF63BAC. List hover
+  @0x7176EA (x <= 286, y 112..328) changes obj+0x30 directly. hk_MouseRead blanks these under our screens.
+- Our screens no longer hide the menu's sprites (moving them broke the slide waits / bar placement); background
+  sprites are copied into pool slots SPR_COVER.. and drawn over the old menu, text drawn by d3d9_sod_calib.cpp.
+- FIXED (build 1113-0738, untested): the list's cursor bar going out of step. Cause: cb_MenuFrame treated the
+  highlighted list entry as an open page and its stale row (obj+0x38, left from the last visit) as the cursor,
+  so PageScroll scrolled that page and shifted sprite 1 (then the list's bar). Rows now only count in states 5-8,
+  and PageScroll moves the bar only in state 7. Was there before the new screen.
+- (was) OPEN BUG (2026-11-13): after leaving GRAPHIC SETTING with Esc and pressing up in the list, or navigating
+  quickly, the list's cursor bar and highlight go out of step (bar on CONTROLLER, DISPLAY highlighted). The test
+  was still on a dinput8 without the build stamp (SoDFix.log line 1 lacks "(build ...)"), so the 07:30 build
+  (screen from state 5, covers from state 5) is untested. NewGraphicsMenu set to 0 in Jamie's ini meanwhile.
+  Note: cb_MenuFrame's value-validation block was rebuilt from the 0.19 source after an accidental deletion.

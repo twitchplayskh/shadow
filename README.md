@@ -1,8 +1,8 @@
-# Lebensbaum
+# Shadow
 
 A modernisation layer for the PC version of **Shadow of Destiny / Shadow of Memories** (Konami, 2002).
 
-Named after the town the game takes place in.
+(Formerly called Lebensbaum, after the town the game takes place in.)
 
 > **Status: experimental and still very buggy.** Expect visual glitches, missing effects in some rooms and the
 > occasional crash. Back up your game folder and your saves before installing. Every change can be undone by
@@ -10,7 +10,7 @@ Named after the town the game takes place in.
 
 ## How it works
 
-Lebensbaum doesn't change any of the game's own files. It's a set of drop-in DLLs that load next to
+Shadow doesn't change any of the game's own files. It's a set of drop-in DLLs that load next to
 `shadow.exe` and work on the game as it runs.
 
 - **`dinput8.dll` (SoDFix)** is a proxy for the system DirectInput DLL, so Windows loads it automatically when the
@@ -116,22 +116,52 @@ All new options appear in the game's own OPTION menus and are saved to `SoDFix.i
 - DRAW DISTANCE: new EXTRA setting that doubles the outdoor view distance. It also draws everything within it,
   so distant walls no longer pop in and out.
 
+**HDR**
+- HDR (GRAPHIC SETTING): an scRGB swap chain for HDR displays. The picture stays as the game drew it (colours,
+  gamma, shadows and midtones match HDR off; menus, text and HUD at paper white). Only the light the game draws
+  additively (glows, halos, lamps, light effects) is lifted: those draws are drawn a second time into a 16-bit float
+  glow image where overlapping glows add up, and at present the near-white pixels under them are raised towards the
+  display's peak with a smooth roll-off. Paper white follows Windows' SDR content brightness unless set.
+- HDR CALIBRATION: Enter on the HDR row (while ON) opens a calibration screen in the game's menu style: a preview of
+  the last played scene (or a test pattern) with five sliders (paper white, peak, highlights, gamma, saturation),
+  DEFAULT and EXIT. Keyboard, controller and mouse.
+
+**Ray tracing**
+- World shadows: the rooms' and streets' own geometry is an occluder for the sun-type lights, so buildings, pillars,
+  lamp posts, furniture and animated flags cast shadows, weighted by the game's baked lighting.
+- LAMP LIGHTING (on with RT SHADOW CASTING, `[Display] LampLighting`, F7 toggles it): the game's own Direct3D point
+  lights (candles, fires, ceiling lamps) light the room around them, with Direct3D's falloff, surface facing and a
+  ray-traced shadow per lamp. The game reuses its light slots between character draws, so a registry keeps every lamp
+  seen in the last second and a half. Traced by the 64-bit helper (pass 7 of `rtmask.comp`) into an RGBA image, then
+  applied as frame x (1 + lamp) outside character pixels. Also traced in rooms without game shadows.
+
 **Controls**
+- Modern controllers through SDL3 (Xbox, PlayStation 3/4/5, Switch Pro / Joy-Cons, Steam Deck, 8BitDo and other
+  pads), plugged in or out at any time; their buttons press the game's own keys. Button prompts follow the device
+  used last (keyboard, A/B, cross/circle, Nintendo).
+- REMAP (CONTROLLER SETTING): choose a key or button for each of the 12 actions; inputs swap so none is used twice
+  (`[Controls] KeyMap` / `PadMap`). TYPE follows the device in use.
 - CONTROLLER SETTING > LAYOUT: MODERN keyboard layout (WASD to move, E / Space to interact, Tab inventory, M map,
   Z / C camera). The original keys keep working too.
 
 **Menus**
-- New option rows drawn in the game's own font, with page scrolling and help lines
-- Menu fixes for the extra rows (cursor, scroll bar, door icons)
+- Redesigned option pages (GRAPHIC, DISPLAY, SOUND, CONTROLLER; `[Display] NewGraphicsMenu`): every row at once with
+  a description panel, drawn by the renderer over the game's own background; the game's menu keeps running
+  underneath and owns the values. Full mouse support. DOORWAY EMPHASIS shows the chosen style as a still icon.
+- SOUND SETTING volumes as sliders, dragged smoothly with the mouse to any percentage (`[Sound] Volume2..4`); the
+  game's volume code is replaced so the sound follows at once.
+- New option rows drawn in the game's own font, with page scrolling and help lines (original layout)
+- Menu fixes: the cursor bar no longer goes out of step when moving through the menus quickly (a bug in the
+  original game), no flash of the old layout when pages open and close
 
 ## Known issues
 
 - Reflections look wrong on some floors (see the cafe, now excluded) and are limited to what is on screen
 - Wall reflections are disabled for now
 - Surface depth (parallax relief on ground textures) is in the code but switched off until it looks right
-- Baked blob shadows under props stay; props do not cast ray-traced shadows yet
+- Baked blob shadows under props stay
 - Some rooms show artefacts where the game's own see-through effects meet the new ones
-- Ray-traced shadows only come from characters (the game's own shadow casters)
+- Lamp lighting: flames drawn without a light (wall candles) do not light the room yet
 - Not tested on AMD or Intel GPUs
 - CRISP TEXT: the smallest help lines are about 10 pixels tall in the game's files, so they come out cleaner but
   not much sharper; text next to the screenshots on the help pages keeps its dark halo. Each text sheet is redrawn

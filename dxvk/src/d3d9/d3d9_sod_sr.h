@@ -1,6 +1,6 @@
 #pragma once
 
-// Lebensbaum texture super-resolution (on top of d3d9_sod_upscale.h). Every upscaled texture is first filled by
+// Shadow texture super-resolution (on top of d3d9_sod_upscale.h). Every upscaled texture is first filled by
 // the fast edge-directed upscaler on upload; it is then queued here and, in the background (a time budget per
 // frame), run through a compact Real-ESRGAN network on the GPU (sod_sr.comp; weights in SoDFix\sr_weights.bin,
 // BSD-3-Clause, Xintao Wang). The result is colour-corrected to the original texture and replaces the image.
@@ -67,6 +67,10 @@ namespace dxvk::sod {
     ~TexCache();
     bool Enabled() const { return !m_dir.empty(); }
     static uint64_t Key(const void* texels, size_t bytes, uint32_t w, uint32_t h, uint32_t format, uint32_t scale, bool opaque);
+    // the same key from rows laid out with a pitch (the texture's own copy in cached memory: reading the upload
+    // buffer back instead is very slow, it is write-combined)
+    static uint64_t KeyRows(const void* texels, size_t rowBytes, uint32_t rows, size_t pitch, uint32_t w, uint32_t h,
+                            uint32_t format, uint32_t scale, bool opaque);
     bool Load(uint64_t key, size_t bytes, std::vector<uint8_t>& out) const;
     void Store(uint64_t key, std::vector<uint8_t>&& data);
   private:

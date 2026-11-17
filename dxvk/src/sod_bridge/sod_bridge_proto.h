@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #define SOD_BRIDGE_MAGIC    0x54524453u   /* 'SDRT' */
-#define SOD_BRIDGE_VERSION  5u
+#define SOD_BRIDGE_VERSION  7u
 
 // object names (suffix: decimal PID of shadow.exe)
 #define SOD_BRIDGE_MAPPING  "Local\\SoDRT_Bridge_"
@@ -24,7 +24,7 @@
 
 // v3 (bridge B2b): per-request frame geometry in a second shared mapping, one slot per request slot
 #define SOD_BRIDGE_GEOMETRY "Local\\SoDRT_Geom_"
-#define SOD_GEOM_SLOT_BYTES (1u << 20)
+#define SOD_GEOM_SLOT_BYTES (4u << 20)
 #define SOD_MAX_LIGHTS      8u
 #define SOD_MAX_CASTERS     64u
 #define SOD_GEOM_MAGIC      0x4D4F4547u   /* 'GEOM' */
@@ -73,6 +73,15 @@ struct SodGeomLightBox {
   float    vMin, vMax, lMax, pad;
 };
 
+// v7 (lamp lighting): the game's own point lights (Direct3D lights: candles, fires, ceiling lamps), world space.
+// Each lights the scene around it with a ray-traced shadow; the result is an extra RGBA8 image after the light
+// factors in the result buffer (offset SodLampOffset), applied as frame *= 1 + lamp.
+#define SOD_MAX_LAMPS       16u
+struct SodGeomLamp {
+  float    pos[3];  float range;
+  float    color[3]; float att0;
+  float    att1, att2, strength, pad;
+};
 struct SodGeomFrame {
   uint32_t magic, frame, width, height;
   float    vpX, vpY, vpW, vpH;
@@ -81,9 +90,32 @@ struct SodGeomFrame {
   SodGeomLight  lights[SOD_MAX_LIGHTS];
   SodGeomCaster casters[SOD_MAX_CASTERS];
   SodGeomLightBox boxes[SOD_MAX_LIGHTS];
+  uint32_t lampCount, lampPad[3];
+  SodGeomLamp lamps[SOD_MAX_LAMPS];
   // followed by float tris[triCount][9] (three world-space xyz vertices each)
 };
+// byte offset of the lamp image (width * height * 4 bytes) in the result buffer
+static inline uint64_t SodLampOffset(uint32_t w, uint32_t h) { return ((uint64_t(w) * h + 3u) & ~uint64_t(3)) + 255u & ~uint64_t(255); }
 #define SOD_GEOM_MAX_TRIS   ((SOD_GEOM_SLOT_BYTES - sizeof(SodGeomFrame)) / 36u)
+
+// v6 (world shadows): the room / street geometry (the game's prelit FVF 0x142 draws) as occluders for every light,
+// in its own mapping because it is large and changes only when the area changes. Two halves: the 32-bit side
+// writes the half (generation + 1) & 1, then publishes generation + 1; the helper uses half generation & 1.
+// A request uses the world when its frame's flags have SOD_GEOM_FLAG_WORLD.
+#define SOD_BRIDGE_WORLD     "Local\\SoDRT_World_"
+#define SOD_WORLD_MAGIC      0x444C5257u   /* 'WRLD' */
+#define SOD_WORLD_MAX_TRIS   300000u
+#define SOD_WORLD_HALF_BYTES (SOD_WORLD_MAX_TRIS * 48u)   // float tris[n][9] (36 bytes), then uint32_t colours[n][3]
+#define SOD_GEOM_FLAG_WORLD  4u
+#define SOD_GEOM_FLAG_AO     16u     // ray-traced ambient occlusion, multiplied into the light factor
+struct SodWorldHeader {
+  uint32_t magic;
+  volatile uint32_t generation;    // 0 = nothing yet
+  uint32_t triCount[2];
+  float    litRef[2];              // luminance (0..1) of the area's fully lit baked vertex colour
+  uint32_t reserved[10];
+};
+#define SOD_WORLD_BYTES (sizeof(SodWorldHeader) + 2u * SOD_WORLD_HALF_BYTES)
 
 
 struct SodBridgeShared {

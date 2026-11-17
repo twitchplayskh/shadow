@@ -1,4 +1,4 @@
-// Lebensbaum diagnostics: camera / frame-pacing trace. Started with F10 in the game or by creating the file
+// Shadow diagnostics: camera / frame-pacing trace. Started with F10 in the game or by creating the file
 // %LOCALAPPDATA%\SoDRT\camtrace.go (deleted when picked up). Records 600 presented frames to
 // %LOCALAPPDATA%\SoDRT\camtrace.csv: present time, the camera (inverse of the first room draw's view matrix) and
 // the world position of the first character part drawn (fixed-function FVF 0x1D2 without stencil). A frame whose

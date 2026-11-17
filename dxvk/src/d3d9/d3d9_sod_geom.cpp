@@ -1,4 +1,4 @@
-// Lebensbaum IMPROVED GEOMETRY. The game lays its street paving one polygon at a time: every polygon shows one
+// Shadow IMPROVED GEOMETRY. The game lays its street paving one polygon at a time: every polygon shows one
 // whole tile of the same cobble texture, rotated and mirrored independently (3278 floor triangles measured: four
 // right-angle orientations, odd angles on curves, 30 % mirrored). Every polygon edge is therefore a seam, and the
 // repeat is broken up by those seams. With IMPROVED GEOMETRY on, those draws are textured in world space instead:
@@ -8,6 +8,7 @@
 // the textures (page regions / cut slots, with the tile size in world units measured from ccc.wad).
 
 #include "d3d9_device.h"
+#include "d3d9_sod_prof.h"
 #include "d3d9_texture.h"
 
 #include <algorithm>
@@ -397,6 +398,8 @@ namespace dxvk {
 
   bool D3D9DeviceEx::SodGeomDraw(D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount) {
     if (m_sodInternal || m_sodGeomFailed || m_sodRt.ImprovedGeometry() <= 0) return false;
+    ::sod::prof::Scope pz(::sod::prof::ZGeomDraw);
+    if (m_sodInternal || m_sodGeomFailed || m_sodRt.ImprovedGeometry() <= 0) return false;
     if (!m_state.vertexDecl || m_state.vertexShader.ptr() || m_state.pixelShader.ptr()) return false;
     if (m_state.vertexDecl->GetFVF() != (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)) return false;
     auto it = m_sodGeomMap.find(m_state.textures[0]);
@@ -428,7 +431,7 @@ namespace dxvk {
       c.vbUid = vbUid; c.ibUid = ibUid; c.vbGen = vb->SodWriteGen(); c.ibGen = ib->SodWriteGen();
       c.base = base; c.minIndex = minIndex; c.numVertices = numVertices; c.startIndex = startIndex; c.primCount = primCount;
       c.type = utype; c.tex = tex; std::memcpy(c.rot, rot, sizeof(rot));
-      SodGeomBuild(c, it->second);
+      { ::sod::prof::Scope pz(::sod::prof::ZGeomBuild); SodGeomBuild(c, it->second); }
       m_sodGeomBuilds++;
       if (m_sodGeomCache.size() > 8192u) { SodGeomDropCache(); return false; }
     }

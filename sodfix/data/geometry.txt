@@ -1,4 +1,4 @@
-# Lebensbaum IMPROVED GEOMETRY: ground textures laid out seamlessly in world space
+# Shadow IMPROVED GEOMETRY: ground textures laid out seamlessly in world space
 # (generated from ccc.wad by tools/geometry/make_geometry_list.py: texel density measured on every floor triangle;
 #  textures used at one consistent scale only)
 # page <table index> <page w> <page h> <x> <y> <w> <h> <tile size in world units>
